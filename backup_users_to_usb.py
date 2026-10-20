@@ -17,7 +17,51 @@ except ImportError:
     print("Install with: apk add python3 py3-tqdm")
     sys.exit(1)
 
-USB = Path("/mnt/usb")
+def find_usb_mountpoint() -> Path:
+    preferred = Path("/mnt/usb")
+    if preferred.exists() and preferred.is_dir():
+        return preferred
+
+    result = subprocess.run(
+        ["lsblk", "-nrpo", "NAME,TYPE,RM,MOUNTPOINT,FSTYPE"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return Path("/root/backup")
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name, dev_type, removable, mountpoint = parts[:4]
+        if dev_type != "part":
+            continue
+        if removable != "1":
+            continue
+        if mountpoint and mountpoint != "":  # already mounted USB
+            return Path(mountpoint)
+        if name.startswith("/dev/"):
+            try:
+                preferred.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["mount", "-o", "rw", name, str(preferred)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if preferred.exists():
+                    return preferred
+            except Exception:
+                pass
+
+    fallback = Path("/root/backup")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+USB = find_usb_mountpoint()
 OUT_DIR = USB / "windows_backup"
 TREE_FILE = OUT_DIR / "windows_users_tree.txt"
 
@@ -261,10 +305,16 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
 
 
 def main():
-    if not USB.exists():
-        print(f"USB not mounted: {USB}")
-        sys.exit(1)
+    global USB, OUT_DIR, TREE_FILE
 
+    if not USB.exists() or not USB.is_dir():
+        print(f"Backup target not available: {USB}")
+        print("Trying fallback location.")
+        USB = Path("/root/backup")
+        USB.mkdir(parents=True, exist_ok=True)
+
+    OUT_DIR = USB / "windows_backup"
+    TREE_FILE = OUT_DIR / "windows_users_tree.txt"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
