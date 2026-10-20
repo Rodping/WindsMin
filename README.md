@@ -59,7 +59,8 @@ removable USB drive that also contains the small Alpine boot partition. It
 does not need a volume label. It prefers a suitable sibling partition on the
 same USB drive as the script; when Alpine is running from RAM, it looks for a
 unique removable drive with a small FAT boot partition (up to 3 GB) and a
-larger data partition (at least 4 GB).
+larger data partition (at least 10 GiB). The 13.5 GiB data partition on a
+nominal 16 GB flash drive is large enough to meet this detection threshold.
 
 The selected partition must already have a supported filesystem. The script
 does not format, rename, or erase it. If it is not mounted, the script mounts

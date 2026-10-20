@@ -21,7 +21,7 @@ except ImportError:
 
 
 BOOT_PARTITION_MAX_SIZE = 3 * 1024**3
-DATA_PARTITION_MIN_SIZE = 4 * 1024**3
+DATA_PARTITION_MIN_SIZE = 10 * 1024**3
 SYS_BLOCK_PATH = Path("/sys/class/block")
 WRITABLE_FILESYSTEMS = {
     "exfat",
@@ -125,6 +125,7 @@ def get_backup_partition(partitions: list[dict]) -> dict:
             if partition.get("_parent_name") == script_partition.get("_parent_name")
             and partition.get("name") != script_partition.get("name")
             and partition.get("fstype") in WRITABLE_FILESYSTEMS
+            and int(partition.get("size") or 0) >= DATA_PARTITION_MIN_SIZE
             and int(partition.get("size") or 0) > int(script_partition.get("size") or 0)
         ]
         if siblings:
