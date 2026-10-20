@@ -19,95 +19,216 @@ except ImportError:
     sys.exit(1)
 
 
-def find_usb_mountpoint() -> Path:
-    preferred = Path("/mnt/usb")
-    if preferred.exists() and preferred.is_dir():
-        return preferred
+BOOT_PARTITION_MAX_SIZE = 3 * 1024**3
+DATA_PARTITION_MIN_SIZE = 4 * 1024**3
+WRITABLE_FILESYSTEMS = {
+    "exfat",
+    "vfat",
+    "fat",
+    "fat12",
+    "fat16",
+    "fat32",
+    "ext2",
+    "ext3",
+    "ext4",
+    "btrfs",
+    "xfs",
+}
 
+
+def list_partitions() -> list[dict]:
     result = subprocess.run(
-        ["lsblk", "-nrpo", "NAME,TYPE,RM,MOUNTPOINT,FSTYPE"],
+        [
+            "lsblk",
+            "--json",
+            "--bytes",
+            "--paths",
+            "--output",
+            "NAME,TYPE,PKNAME,RM,TRAN,SIZE,FSTYPE,MOUNTPOINTS,RO",
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
     if result.returncode != 0:
-        return Path("/root/backup")
+        raise RuntimeError(f"Could not inspect disks with lsblk: {result.stderr.strip()}")
 
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        name, dev_type, removable, mountpoint = parts[:4]
-        if dev_type != "part":
-            continue
-        if removable != "1":
-            continue
-        if mountpoint and mountpoint != "":
-            return Path(mountpoint)
-        if name.startswith("/dev/"):
-            try:
-                preferred.mkdir(parents=True, exist_ok=True)
-                subprocess.run(
-                    ["mount", "-o", "rw", name, str(preferred)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
+    partitions = []
+
+    def walk(devices: list[dict], parent: dict | None = None) -> None:
+        for device in devices:
+            if device.get("type") == "part":
+                partition = dict(device)
+                partition["_parent_name"] = device.get("pkname") or (
+                    parent.get("name") if parent else None
                 )
-                if preferred.exists():
-                    return preferred
-            except Exception:
-                pass
+                partition["_parent_rm"] = parent.get("rm") if parent else device.get("rm")
+                partition["_parent_tran"] = (
+                    parent.get("tran") if parent else device.get("tran")
+                )
+                partitions.append(partition)
+            walk(device.get("children", []), device)
 
-    fallback = Path("/root/backup")
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    walk(json.loads(result.stdout).get("blockdevices", []))
+    return partitions
 
 
-def resolve_backup_root() -> Path:
-    candidates = [
-        Path("/mnt/usb"),
-        Path("/media/usb"),
-        Path("/root/backup"),
+def is_path_inside(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def find_script_partition(partitions: list[dict]) -> dict | None:
+    script_directory = Path(__file__).resolve().parent
+    matches = [
+        (mountpoint, partition)
+        for partition in partitions
+        for mountpoint in get_mountpoints(partition)
+        if is_path_inside(script_directory, mountpoint)
     ]
+    if not matches:
+        return None
+    return max(matches, key=lambda match: len(str(match[0])))[1]
 
-    for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            if os.access(candidate, os.W_OK):
-                return candidate
-        except OSError:
-            pass
 
+def is_removable_disk(partition: dict) -> bool:
+    return str(partition.get("_parent_rm", "")).lower() in {"1", "true"} or (
+        str(partition.get("_parent_tran", "")).lower() == "usb"
+    )
+
+
+def get_backup_partition(partitions: list[dict]) -> dict:
+    script_partition = find_script_partition(partitions)
+
+    if script_partition and is_removable_disk(script_partition):
+        siblings = [
+            partition
+            for partition in partitions
+            if partition.get("_parent_name") == script_partition.get("_parent_name")
+            and partition.get("name") != script_partition.get("name")
+            and partition.get("fstype") in WRITABLE_FILESYSTEMS
+            and int(partition.get("size") or 0) > int(script_partition.get("size") or 0)
+        ]
+        if siblings:
+            return max(siblings, key=lambda partition: int(partition.get("size") or 0))
+
+    # If the script is running from RAM, use the unique removable disk with
+    # a small Alpine-sized FAT boot partition and one larger data partition.
+    disks: dict[str, list[dict]] = {}
+    for partition in partitions:
+        parent = partition.get("_parent_name")
+        if parent and is_removable_disk(partition):
+            disks.setdefault(parent, []).append(partition)
+
+    candidates = []
+    for disk_partitions in disks.values():
+        has_small_boot_partition = any(
+            partition.get("fstype") in {"vfat", "fat", "fat12", "fat16", "fat32"}
+            and int(partition.get("size") or 0) <= BOOT_PARTITION_MAX_SIZE
+            for partition in disk_partitions
+        )
+        data_partitions = [
+            partition
+            for partition in disk_partitions
+            if partition.get("fstype") in WRITABLE_FILESYSTEMS
+            and int(partition.get("size") or 0) >= DATA_PARTITION_MIN_SIZE
+        ]
+        if has_small_boot_partition and data_partitions:
+            candidates.append(
+                max(data_partitions, key=lambda partition: int(partition.get("size") or 0))
+            )
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if not candidates:
+        raise RuntimeError(
+            "Could not identify the backup partition. Expected a larger writable "
+            "partition on the removable USB drive that contains the small Alpine "
+            "boot partition. No disk was changed."
+        )
+    raise RuntimeError(
+        "More than one removable USB drive could be the backup target. "
+        "Disconnect other removable drives and try again. No disk was changed."
+    )
+
+
+def is_mount_read_write(path: Path) -> bool:
     result = subprocess.run(
-        ["lsblk", "-nrpo", "NAME,TYPE,RM,MOUNTPOINT"],
+        ["findmnt", "--noheadings", "--output", "OPTIONS", "--target", str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            name, dev_type, removable, mountpoint = parts[:4]
-            if dev_type == "part" and removable == "1" and mountpoint == "":
-                target = Path("/mnt/usb")
-                try:
-                    target.mkdir(parents=True, exist_ok=True)
-                    subprocess.run(
-                        ["mount", "-o", "rw", name, str(target)],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    if target.exists() and os.access(target, os.W_OK):
-                        return target
-                except OSError:
-                    pass
+    return result.returncode == 0 and "rw" in result.stdout.strip().split(",")
 
-    fallback = Path("/root/backup")
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+
+def resolve_backup_root() -> Path:
+    partitions = list_partitions()
+    partition = get_backup_partition(partitions)
+    device = partition["name"]
+    if partition.get("fstype") == "vfat":
+        print(
+            "Warning: the backup partition uses FAT. If it is FAT32, individual "
+            "files larger than 4 GB cannot be stored.",
+            file=sys.stderr,
+        )
+
+    mounted_paths = get_mountpoints(partition)
+    for mountpoint in mounted_paths:
+        if is_mount_read_write(mountpoint) and os.access(mountpoint, os.W_OK):
+            return mountpoint
+
+    if mounted_paths:
+        mountpoint = mounted_paths[0]
+        raise RuntimeError(
+            f"Backup partition {device} is mounted read-only at {mountpoint}. "
+            "Remount it read-write and try again."
+        )
+
+    mountpoint = Path("/mnt") / f"windsmin-backup-{Path(device).name}"
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    existing_mount = subprocess.run(
+        [
+            "findmnt",
+            "--noheadings",
+            "--output",
+            "SOURCE",
+            "--mountpoint",
+            str(mountpoint),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if existing_mount.returncode == 0:
+        raise RuntimeError(
+            f"Mount path {mountpoint} is already in use by "
+            f"{existing_mount.stdout.strip()}; refusing to write there."
+        )
+
+    filesystem = partition["fstype"]
+    if filesystem in {"fat", "fat12", "fat16", "fat32"}:
+        filesystem = "vfat"
+    result = subprocess.run(
+        ["mount", "-t", filesystem, "-o", "rw", device, str(mountpoint)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not mount backup partition {device} read-write: "
+            f"{result.stderr.strip()}"
+        )
+    if not is_mount_read_write(mountpoint):
+        raise RuntimeError(
+            f"Backup partition {device} did not mount read-write at {mountpoint}."
+        )
+    return mountpoint
 
 
 EXCLUDED_DIRS = {
@@ -144,32 +265,11 @@ def is_windows_root(path: Path) -> bool:
     return (path / "Windows").is_dir() and (path / "Users").is_dir()
 
 
-def get_partitions(devices: list[dict]) -> Iterator[dict]:
-    for device in devices:
-        if device.get("type") == "part":
-            yield device
-        yield from get_partitions(device.get("children", []))
-
-
 def get_mountpoints(partition: dict) -> list[Path]:
     mountpoints = partition.get("mountpoints") or []
     if isinstance(mountpoints, str):
         mountpoints = [mountpoints]
     return [Path(path) for path in mountpoints if path]
-
-
-def list_partitions() -> list[dict]:
-    result = subprocess.run(
-        ["lsblk", "--json", "--paths", "--output", "NAME,TYPE,FSTYPE,MOUNTPOINTS"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Could not inspect disks with lsblk: {result.stderr.strip()}")
-
-    devices = json.loads(result.stdout).get("blockdevices", [])
-    return list(get_partitions(devices))
 
 
 def mount_partition_read_only(device: str, filesystem: str, mountpoint: str) -> None:
@@ -429,7 +529,12 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
 def main():
     global USB, OUT_DIR, TREE_FILE
 
-    USB = resolve_backup_root()
+    try:
+        USB = resolve_backup_root()
+    except (FileNotFoundError, RuntimeError) as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
+
     OUT_DIR = USB / "windows_backup"
     TREE_FILE = OUT_DIR / "windows_users_tree.txt"
 

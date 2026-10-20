@@ -43,29 +43,49 @@ whose names match one of these exclusions:
 - `Program Files`
 - `ProgramData`
 - `$Recycle.Bin`
+- `All Users`
+- `Default User`
+- `Public`
 
 The exclusions apply wherever those directory names appear in the profile
-tree. The tree file shows an excluded directory's name but does not list its
-contents. The tree records names and directory structure only; it does not
-contain file contents.
+tree. Excluded directories are omitted from the copy and the tree files. Tree
+files record names and directory structure only; they do not contain file
+contents. The script also skips symbolic links and junctions.
 
 ## Backup destination
 
-The destination must already be mounted at `/mnt/usb`. The script does not
-choose or mount the destination drive automatically. It writes to:
+The script automatically selects the larger writable partition on the
+removable USB drive that also contains the small Alpine boot partition. It
+does not need a volume label. It prefers a suitable sibling partition on the
+same USB drive as the script; when Alpine is running from RAM, it looks for a
+unique removable drive with a small FAT boot partition (up to 3 GB) and a
+larger data partition (at least 4 GB).
+
+The selected partition must already have a supported filesystem. The script
+does not format, rename, or erase it. If it is not mounted, the script mounts
+it read-write at a path such as `/mnt/windsmin-backup-sdb2`. If there is more
+than one possible USB drive, or the intended partition cannot be identified
+safely, the script stops and reports the problem instead of writing to the
+Alpine system disk.
+
+Backups are stored in a `windows_backup` directory on the selected partition:
 
 ```text
-/mnt/usb/windows_backup/
-├── Users/                         # Users folder from one Windows installation
-├── OtherVolumes/<device>/Users/    # Users folders from other volumes
-└── windows_users_tree.txt
+<backup partition>/windows_backup/
+├── Users/                              # Profiles from one Windows installation
+├── OtherVolumes/<device>/Users/        # Profiles from other volumes/installations
+└── <device>_<user>_tree.txt            # One directory tree per profile
 ```
 
-When more than one Windows installation is found, each installation's profiles
-are also stored under `OtherVolumes/<device>/Users/` to avoid mixing them.
-Make sure the destination has enough free space for the files being copied.
-The 16 GB Alpine boot drive is not automatically used as the backup
-destination.
+When multiple Windows installations are found, their profiles are placed under
+`OtherVolumes/<device>/Users/` to avoid mixing them. Make sure the data
+partition has enough free space for the files being copied. A destination
+partition mounted by the script stays mounted at its `/mnt/windsmin-backup-*`
+path until it is unmounted or the computer shuts down.
+FAT32 volumes cannot store a single file larger than 4 GB. The script warns
+when the selected partition is reported as `vfat`; use a suitable filesystem
+such as exFAT if your backup includes larger files. Formatting a partition
+erases its contents, so the script never formats it automatically.
 
 ## Requirements
 
@@ -76,7 +96,8 @@ destination.
 - Filesystem support for the source partitions. The script considers NTFS,
   exFAT, FAT, ext2/3/4, Btrfs, and XFS partitions. NTFS mounting tries the
   `ntfs3` driver and then `ntfs-3g`.
-- A destination drive mounted at `/mnt/usb`.
+- A removable USB drive with a small Alpine boot partition and a larger,
+  writable data partition formatted with a supported filesystem.
 
 ## Running it on Alpine
 
@@ -87,8 +108,8 @@ sh backup.sh
 ```
 
 `backup.sh` installs `python3`, `util-linux`, `ntfs-3g`, and `py3-tqdm` with
-`apk`, then starts the Python script. Package installation requires access to
-the configured Alpine package repositories. You can run
+`apk`, pulls the latest project changes with `git pull`, then starts the Python
+script. Package installation and `git pull` require network access. You can run
 `python3 backup_users_to_usb.py` directly if those dependencies are already
 installed.
 
@@ -97,8 +118,9 @@ Already-mounted source partitions keep their existing mount mode.
 
 ## Alpine diskless mode and `lbu commit`
 
-The backup files are written to `/mnt/usb/windows_backup`; `lbu commit` is not
-needed to save them. The script does not run `lbu commit`.
+The backup files are written to the selected data partition, not to Alpine's
+RAM-based root filesystem; `lbu commit` is not needed to save them. The script
+does not run `lbu commit`.
 
 On a diskless Alpine system, packages installed with `apk add` may not remain
 installed after reboot unless the system's local backup configuration saves
