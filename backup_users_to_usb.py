@@ -61,9 +61,51 @@ def find_usb_mountpoint() -> Path:
     return fallback
 
 
-USB = find_usb_mountpoint()
-OUT_DIR = USB / "windows_backup"
-TREE_FILE = OUT_DIR / "windows_users_tree.txt"
+def resolve_backup_root() -> Path:
+    candidates = [
+        Path("/mnt/usb"),
+        Path("/media/usb"),
+        Path("/root/backup"),
+    ]
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            if os.access(candidate, os.W_OK):
+                return candidate
+        except OSError:
+            pass
+
+    result = subprocess.run(
+        ["lsblk", "-nrpo", "NAME,TYPE,RM,MOUNTPOINT"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name, dev_type, removable, mountpoint = parts[:4]
+            if dev_type == "part" and removable == "1" and mountpoint == "":
+                target = Path("/mnt/usb")
+                try:
+                    target.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(
+                        ["mount", "-o", "rw", name, str(target)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if target.exists() and os.access(target, os.W_OK):
+                        return target
+                except OSError:
+                    pass
+
+    fallback = Path("/root/backup")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 EXCLUDED_DIRS = {
     "AppData",
@@ -307,13 +349,12 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
 def main():
     global USB, OUT_DIR, TREE_FILE
 
-    if not USB.exists() or not USB.is_dir():
-        print(f"Backup target not available: {USB}")
-        print("Trying fallback location.")
-        USB = Path("/root/backup")
-        USB.mkdir(parents=True, exist_ok=True)
-
+    USB = resolve_backup_root()
     OUT_DIR = USB / "windows_backup"
+    TREE_FILE = OUT_DIR / "windows_users_tree.txt"
+
+    print(f"Using backup target: {USB}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     TREE_FILE = OUT_DIR / "windows_users_tree.txt"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
