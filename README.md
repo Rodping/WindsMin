@@ -72,9 +72,10 @@ Backups are stored in a `windows_backup` directory on the selected partition:
 
 ```text
 <backup partition>/windows_backup/
-├── Users/                              # Profiles from one Windows installation
-├── OtherVolumes/<device>/Users/        # Profiles from other volumes/installations
-└── <device>_<user>_tree.txt            # One directory tree per profile
+└── source_<disk-id>/
+    ├── Users/                          # Profiles from one Windows installation
+    ├── OtherVolumes/<device>/Users/     # Profiles from other volumes/installations
+    └── <device>_<user>_tree.txt         # One directory tree per profile
 ```
 
 When multiple Windows installations are found, their profiles are placed under
@@ -87,11 +88,38 @@ when the selected partition is reported as `vfat`; use a suitable filesystem
 such as exFAT if your backup includes larger files. Formatting a partition
 erases its contents, so the script never formats it automatically.
 
+## Resuming an interrupted backup
+
+The script keeps a small progress file beside each source-specific backup.
+After a file is copied successfully, its source disk identity, path, size, and
+modification time are recorded. File contents are first copied to a temporary
+file and then renamed into place, so an interrupted partial file is not treated
+as a completed backup.
+Temporary files left by a sudden power loss are cleaned up when that same
+source-specific backup is run again.
+
+If you press `Ctrl+C`, the script stops and keeps the progress file. If the PC
+loses power, completed-file progress already saved on the data partition remains
+there. On the next run, when the same source disk is detected, the script asks
+whether to resume or start over. Resuming skips files already recorded as
+complete when their source size and modification time still match and the
+destination file exists with the expected size. Changed or incomplete files
+are copied again.
+
+The source-specific directory is based on the attached source volume IDs, so
+backups from different PCs with different disk IDs are kept separately. If a
+disk does not provide a filesystem UUID, the Linux device name is used as a
+fallback; in that case, the script cannot reliably recognize the same disk
+after its device name changes. Disconnect other computers' source disks while
+resuming, and make sure the original source disk is attached. If you choose to
+start over, existing copied files are overwritten as needed; unrelated files
+are not deleted.
+
 ## Requirements
 
 - Alpine Linux with permission to inspect and mount disks (normally run as
   `root`).
-- `lsblk`, `mount`, and `umount` from `util-linux`.
+- `lsblk`, `findmnt`, `mount`, and `umount` from `util-linux`.
 - Python 3 and the Python `tqdm` progress-bar package.
 - Filesystem support for the source partitions. The script considers NTFS,
   exFAT, FAT, ext2/3/4, Btrfs, and XFS partitions. NTFS mounting tries the

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,7 @@ def list_partitions() -> list[dict]:
             "--bytes",
             "--paths",
             "--output",
-            "NAME,TYPE,PKNAME,RM,TRAN,SIZE,FSTYPE,MOUNTPOINTS,RO",
+            "NAME,TYPE,PKNAME,RM,TRAN,SIZE,FSTYPE,UUID,MOUNTPOINTS,RO",
         ],
         capture_output=True,
         text=True,
@@ -257,6 +258,7 @@ MOUNTABLE_FILESYSTEMS = NTFS_FILESYSTEMS | {
 @dataclass(frozen=True)
 class UserVolume:
     device: str
+    identity: str
     root: Path
     is_windows_installation: bool
 
@@ -362,6 +364,7 @@ def find_user_volumes() -> Iterator[list[UserVolume]]:
                 user_volumes.append(
                     UserVolume(
                         device=device,
+                        identity=partition.get("uuid") or device,
                         root=mountpoint,
                         is_windows_installation=is_windows_root(mountpoint),
                     )
@@ -372,6 +375,13 @@ def find_user_volumes() -> Iterator[list[UserVolume]]:
             raise FileNotFoundError(
                 "Could not find a Windows installation and Users folder on an "
                 f"available disk partition.{details}"
+            )
+
+        volume_ids = [volume.identity for volume in user_volumes]
+        if len(volume_ids) != len(set(volume_ids)):
+            raise RuntimeError(
+                "Two source partitions have the same filesystem UUID. "
+                "Cannot safely separate backup progress for these disks."
             )
 
         yield user_volumes
@@ -417,38 +427,7 @@ def get_total_size(path: Path) -> int:
     return total
 
 
-def write_directory_tree(current: Path, handle) -> None:
-    entries = [
-        entry
-        for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
-        if not entry.is_symlink() and entry.name not in EXCLUDED_DIRS
-    ]
-
-    for index, entry in enumerate(entries):
-        connector = "└── " if index == len(entries) - 1 else "├── "
-        handle.write(f"{connector}{entry.name}\n")
-
-        if entry.is_dir():
-            next_prefix = "    " if index == len(entries) - 1 else "│   "
-            child_entries = [
-                child
-                for child in sorted(entry.iterdir(), key=lambda p: p.name.lower())
-                if not child.is_symlink() and child.name not in EXCLUDED_DIRS
-            ]
-            if child_entries:
-                handle.write(f"{next_prefix}...")
-                # We keep the tree output simple and readable by recursing.
-            
-            # The recursive walk below keeps the full directory tree.
-            for child_index, child in enumerate(child_entries):
-                child_connector = "└── " if child_index == len(child_entries) - 1 else "├── "
-                handle.write(f"{next_prefix}{child_connector}{child.name}\n")
-                if child.is_dir():
-                    sub_prefix = next_prefix + ("    " if child_index == len(child_entries) - 1 else "│   ")
-                    _walk(child, handle, sub_prefix)
-
-
-def _walk(current: Path, handle, prefix: str = "") -> None:
+def write_directory_tree(current: Path, handle, prefix: str = "") -> None:
     entries = [
         entry
         for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
@@ -459,7 +438,7 @@ def _walk(current: Path, handle, prefix: str = "") -> None:
         handle.write(f"{prefix}{connector}{entry.name}\n")
         if entry.is_dir():
             next_prefix = prefix + ("    " if index == len(entries) - 1 else "│   ")
-            _walk(entry, handle, next_prefix)
+            write_directory_tree(entry, handle, next_prefix)
 
 
 def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> None:
@@ -474,7 +453,7 @@ def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> None:
 
             with open(tree_path, "w", encoding="utf-8", errors="ignore") as handle:
                 handle.write(f"{user_dir.name}\n")
-                _walk(user_dir, handle)
+                write_directory_tree(user_dir, handle)
 
             print(f"Saved directory tree: {tree_path}")
 
@@ -486,7 +465,162 @@ def get_backup_path(volume: UserVolume, windows_volume_count: int, dst: Path) ->
     return dst / "OtherVolumes" / device_name / "Users"
 
 
-def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
+def get_source_backup_dir(volumes: list[UserVolume], out_dir: Path) -> Path:
+    source_ids = sorted(volume.identity for volume in volumes)
+    fingerprint = hashlib.sha256("\n".join(source_ids).encode("utf-8")).hexdigest()[:12]
+    return out_dir / f"source_{fingerprint}"
+
+
+def get_file_signature(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def load_completed_files(progress_file: Path, source_ids: list[str]) -> dict[str, dict]:
+    lines = progress_file.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise RuntimeError(f"Resume file is empty and cannot be read: {progress_file}")
+
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Resume file has an invalid header: {progress_file}") from error
+
+    if header.get("type") != "header" or header.get("source_ids") != source_ids:
+        raise RuntimeError(
+            "The saved progress belongs to a different source disk set. "
+            "Refusing to resume it."
+        )
+
+    completed = {}
+    for index, line in enumerate(lines[1:], start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            if index == len(lines) - 1:
+                print("Ignoring an incomplete final resume record.", file=sys.stderr)
+                continue
+            raise RuntimeError(
+                f"Resume file contains invalid data on line {index + 1}: {progress_file}"
+            ) from error
+        if record.get("type") == "file":
+            try:
+                completed[record["path"]] = {
+                    "size": record["size"],
+                    "mtime_ns": record["mtime_ns"],
+                }
+            except KeyError as error:
+                raise RuntimeError(
+                    f"Resume file contains an incomplete record on line {index + 1}."
+                ) from error
+    return completed
+
+
+def start_progress_file(progress_file: Path, volumes: list[UserVolume]) -> None:
+    header = {
+        "type": "header",
+        "version": 1,
+        "source_ids": sorted(volume.identity for volume in volumes),
+        "sources": [
+            {"device": volume.device, "identity": volume.identity}
+            for volume in volumes
+        ],
+    }
+    with open(progress_file, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(header, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def record_completed_file(
+    progress_file: Path,
+    relative_path: str,
+    signature: dict[str, int],
+) -> None:
+    record = {
+        "type": "file",
+        "path": relative_path,
+        **signature,
+    }
+    with open(progress_file, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def ask_to_resume(progress_file: Path, volumes: list[UserVolume]) -> bool:
+    print(f"Found an unfinished backup: {progress_file.parent}")
+    print(
+        "Current source disks: "
+        + ", ".join(f"{volume.device} (ID {volume.identity})" for volume in volumes)
+    )
+    try:
+        answer = input("Resume that backup? [Y/n] ").strip().lower()
+    except EOFError as error:
+        raise RuntimeError(
+            "An unfinished backup exists, but no interactive terminal is available. "
+            "Run the script interactively to choose resume or restart."
+        ) from error
+    return answer not in {"n", "no"}
+
+
+def iter_backup_files(users_root: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(users_root):
+        current_root = Path(root)
+        dirs[:] = sorted(
+            (
+                directory
+                for directory in dirs
+                if directory not in EXCLUDED_DIRS
+                and not (current_root / directory).is_symlink()
+            ),
+            key=str.lower,
+        )
+        for file_name in sorted(files, key=str.lower):
+            source_file = current_root / file_name
+            if not source_file.is_symlink():
+                yield source_file
+
+
+def copy_file_atomically(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".windsmin-copy-",
+        suffix=".partial",
+        dir=destination.parent,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary_path)
+        with open(temporary_path, "rb") as copied_file:
+            os.fsync(copied_file.fileno())
+        os.replace(temporary_path, destination)
+        directory_fd = os.open(
+            destination.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def remove_abandoned_temporary_files(out_dir: Path) -> None:
+    for root, _dirs, files in os.walk(out_dir):
+        for file_name in files:
+            if file_name.startswith(".windsmin-copy-") and file_name.endswith(".partial"):
+                (Path(root) / file_name).unlink(missing_ok=True)
+
+
+def copy_users_to_usb(
+    volumes: list[UserVolume],
+    dst: Path,
+    progress_file: Path,
+    completed_files: dict[str, dict],
+) -> None:
     windows_volume_count = sum(volume.is_windows_installation for volume in volumes)
     total_size = sum(get_total_size(volume.root / "Users") for volume in volumes)
     print(f"Total bytes to copy: {total_size}")
@@ -499,35 +633,46 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
             users_dst.mkdir(parents=True, exist_ok=True)
 
             for user_dir in iter_real_user_dirs(users_src):
-                src_user = user_dir
-                dst_user = users_dst / src_user.relative_to(users_src)
-                dst_user.mkdir(parents=True, exist_ok=True)
+                (users_dst / user_dir.relative_to(users_src)).mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
 
-                for root, dirs, files in os.walk(src_user):
-                    dirs[:] = [
-                        directory
-                        for directory in dirs
-                        if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
-                    ]
-                    current_root = Path(root)
+            for root, dirs, _files in os.walk(users_src):
+                current_root = Path(root)
+                dirs[:] = [
+                    directory
+                    for directory in dirs
+                    if directory not in EXCLUDED_DIRS
+                    and not (current_root / directory).is_symlink()
+                ]
+                target_dir = users_dst / current_root.relative_to(users_src)
+                for directory in dirs:
+                    (target_dir / directory).mkdir(parents=True, exist_ok=True)
 
-                    for directory in dirs:
-                        src_dir = current_root / directory
-                        dst_dir = users_dst / src_dir.relative_to(users_src)
-                        dst_dir.mkdir(parents=True, exist_ok=True)
+            for source_file in iter_backup_files(users_src):
+                relative_to_users = source_file.relative_to(users_src)
+                destination = users_dst / relative_to_users
+                progress_key = f"{volume.identity}/{relative_to_users.as_posix()}"
+                signature = get_file_signature(source_file)
+                saved_signature = completed_files.get(progress_key)
 
-                    for file_name in files:
-                        src_file = current_root / file_name
-                        if src_file.is_symlink():
-                            continue
-                        dst_file = users_dst / src_file.relative_to(users_src)
-                        dst_file.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src_file, dst_file)
-                        pbar.update(src_file.stat().st_size)
+                if (
+                    saved_signature == signature
+                    and destination.is_file()
+                    and destination.stat().st_size == signature["size"]
+                ):
+                    pbar.update(signature["size"])
+                    continue
+
+                copy_file_atomically(source_file, destination)
+                record_completed_file(progress_file, progress_key, signature)
+                completed_files[progress_key] = signature
+                pbar.update(signature["size"])
 
 
 def main():
-    global USB, OUT_DIR, TREE_FILE
+    global USB
 
     try:
         USB = resolve_backup_root()
@@ -535,26 +680,49 @@ def main():
         print(error, file=sys.stderr)
         sys.exit(1)
 
-    OUT_DIR = USB / "windows_backup"
-    TREE_FILE = OUT_DIR / "windows_users_tree.txt"
-
     print(f"Using backup target: {USB}")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         with find_user_volumes() as volumes:
             print(f"Found {len(volumes)} volume(s) with a Users folder.")
-            save_directory_trees(volumes, OUT_DIR)
+            out_dir = get_source_backup_dir(volumes, USB / "windows_backup")
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            progress_file = out_dir / ".resume.jsonl"
+            if progress_file.exists():
+                resume = ask_to_resume(progress_file, volumes)
+            else:
+                resume = False
+
+            if resume:
+                completed_files = load_completed_files(
+                    progress_file,
+                    sorted(volume.identity for volume in volumes),
+                )
+            else:
+                start_progress_file(progress_file, volumes)
+                completed_files = {}
+
+            remove_abandoned_temporary_files(out_dir)
+            save_directory_trees(volumes, out_dir)
 
             print("\nCopying user folders to USB...")
-            copy_users_to_usb(volumes, OUT_DIR)
+            copy_users_to_usb(volumes, out_dir, progress_file, completed_files)
 
-            print("\nDone.")
-            print(f"Tree files saved to: {OUT_DIR}")
-            print(f"Backup saved to: {OUT_DIR}")
+            progress_file.unlink(missing_ok=True)
+            print("\nBackup completed.")
+            print(f"Directory trees and backup saved to: {out_dir}")
     except (FileNotFoundError, RuntimeError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            "\nBackup stopped. Completed files and progress were saved. "
+            "Run the script again with the same source disk to choose whether "
+            "to resume or start over.",
+            file=sys.stderr,
+        )
+        sys.exit(130)
 
 
 if __name__ == "__main__":
