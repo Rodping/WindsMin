@@ -17,6 +17,7 @@ except ImportError:
     print("Install with: apk add python3 py3-tqdm")
     sys.exit(1)
 
+
 def find_usb_mountpoint() -> Path:
     preferred = Path("/mnt/usb")
     if preferred.exists() and preferred.is_dir():
@@ -107,12 +108,16 @@ def resolve_backup_root() -> Path:
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
+
 EXCLUDED_DIRS = {
     "AppData",
     "Windows",
     "Program Files",
     "ProgramData",
     "$Recycle.Bin",
+    "All Users",
+    "Default User",
+    "Public",
 }
 NTFS_FILESYSTEMS = {"ntfs", "ntfs3"}
 MOUNTABLE_FILESYSTEMS = NTFS_FILESYSTEMS | {
@@ -278,7 +283,11 @@ def find_user_volumes() -> Iterator[list[UserVolume]]:
 def get_total_size(path: Path) -> int:
     total = 0
     for root, dirs, files in os.walk(path):
-        dirs[:] = [directory for directory in dirs if directory not in EXCLUDED_DIRS]
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
+        ]
         for file_name in files:
             total += (Path(root) / file_name).stat().st_size
     return total
@@ -289,9 +298,10 @@ def save_directory_trees(volumes: list[UserVolume], out_file: Path) -> None:
         def walk(current: Path, prefix: str = "") -> None:
             entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
             for i, entry in enumerate(entries):
+                if entry.name in EXCLUDED_DIRS or entry.is_symlink():
+                    continue
                 connector = "└── " if i == len(entries) - 1 else "├── "
                 line = prefix + connector + entry.name
-                # print(line)     # This is decreasing speed of program
                 f.write(line + "\n")
 
                 if (
@@ -330,16 +340,24 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
             users_dst.mkdir(parents=True, exist_ok=True)
 
             for root, dirs, files in os.walk(users_src):
-                dirs[:] = [directory for directory in dirs if directory not in EXCLUDED_DIRS]
+                dirs[:] = [
+                    directory
+                    for directory in dirs
+                    if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
+                ]
                 current_root = Path(root)
 
                 for directory in dirs:
                     src_dir = current_root / directory
+                    if not src_dir.exists():
+                        continue
                     dst_dir = users_dst / src_dir.relative_to(users_src)
                     dst_dir.mkdir(parents=True, exist_ok=True)
 
                 for file_name in files:
                     src_file = current_root / file_name
+                    if not src_file.exists():
+                        continue
                     dst_file = users_dst / src_file.relative_to(users_src)
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_file, dst_file)
