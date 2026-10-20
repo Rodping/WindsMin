@@ -291,7 +291,7 @@ def save_directory_trees(volumes: list[UserVolume], out_file: Path) -> None:
             for i, entry in enumerate(entries):
                 connector = "└── " if i == len(entries) - 1 else "├── "
                 line = prefix + connector + entry.name
-                print(line)
+                # print(line)     # This is decreasing speed of program
                 f.write(line + "\n")
 
                 if (
