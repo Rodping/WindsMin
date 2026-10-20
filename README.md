@@ -91,20 +91,25 @@ erases its contents, so the script never formats it automatically.
 ## Resuming an interrupted backup
 
 The script keeps a small progress file beside each source-specific backup.
-After a file is copied successfully, its source disk identity, path, size, and
-modification time are recorded. File contents are first copied to a temporary
-file and then renamed into place, so an interrupted partial file is not treated
-as a completed backup.
+After each file is safely copied, its source disk identity, path, size, and
+modification time are queued in the progress log. To reduce slow writes to USB,
+the script flushes a durable checkpoint after every 64 files and when it exits.
+File contents are first copied to a temporary file and synced, then renamed
+into place; progress is saved only after the destination directories are synced.
+This keeps resume reliable without forcing a progress-log and directory sync
+after every single file.
 Temporary files left by a sudden power loss are cleaned up when that same
 source-specific backup is run again.
 
 If you press `Ctrl+C`, the script stops and keeps the progress file. If the PC
 loses power, completed-file progress already saved on the data partition remains
-there. On the next run, when the same source disk is detected, the script asks
-whether to resume or start over. Resuming skips files already recorded as
-complete when their source size and modification time still match and the
-destination file exists with the expected size. Changed or incomplete files
-are copied again.
+there. At most the last 63 files since the previous checkpoint may be copied
+again after a sudden power loss; they are not skipped unless their progress was
+durably recorded. On the next run, when the same source disk is detected, the
+script asks whether to resume or start over. Resuming skips files already
+recorded as complete when their source size and modification time still match
+and the destination file exists with the expected size. Changed or incomplete
+files are copied again.
 
 The source-specific directory is based on the attached source volume IDs, so
 backups from different PCs with different disk IDs are kept separately. If a
@@ -168,6 +173,15 @@ backup and does not save the copied profile files.
 - It does not distinguish local from domain profiles, verify copies with
   checksums, or erase old files already at the destination.
 - Protect the backup drive: it may contain private user documents.
+
+## Speed and progress display
+
+The script does not first scan all files just to calculate a total size. It
+creates the requested directory-tree reports, then copies files in a single
+pass using Python's optimized file-copy routines. Progress shows bytes copied
+so far rather than a percentage or estimated time, because calculating an
+exact percentage would require an extra full scan and stat of the source files.
+Copy speed still depends on the source disk, USB port, and flash drive.
 
 ## License
 

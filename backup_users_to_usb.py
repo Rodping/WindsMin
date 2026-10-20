@@ -411,22 +411,6 @@ def iter_real_user_dirs(users_root: Path) -> list[Path]:
     return user_dirs
 
 
-def get_total_size(path: Path) -> int:
-    total = 0
-    for root, dirs, files in os.walk(path):
-        dirs[:] = [
-            directory
-            for directory in dirs
-            if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
-        ]
-        for file_name in files:
-            file_path = Path(root) / file_name
-            if file_path.is_symlink():
-                continue
-            total += file_path.stat().st_size
-    return total
-
-
 def write_directory_tree(current: Path, handle, prefix: str = "") -> None:
     entries = [
         entry
@@ -532,20 +516,44 @@ def start_progress_file(progress_file: Path, volumes: list[UserVolume]) -> None:
         os.fsync(handle.fileno())
 
 
-def record_completed_file(
-    progress_file: Path,
-    relative_path: str,
-    signature: dict[str, int],
-) -> None:
-    record = {
-        "type": "file",
-        "path": relative_path,
-        **signature,
-    }
-    with open(progress_file, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+class ProgressJournal:
+    """Write progress in durable batches after copied files are safely published."""
+
+    CHECKPOINT_EVERY_FILES = 64
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.pending_directories: set[Path] = set()
+        self.pending_records = 0
+
+    def record(
+        self,
+        relative_path: str,
+        signature: dict[str, int],
+        destination_directory: Path,
+    ) -> None:
+        record = {"type": "file", "path": relative_path, **signature}
+        self.handle.write(json.dumps(record, sort_keys=True) + "\n")
+        self.pending_directories.add(destination_directory)
+        self.pending_records += 1
+        if self.pending_records >= self.CHECKPOINT_EVERY_FILES:
+            self.sync()
+
+    def sync(self) -> None:
+        for directory in self.pending_directories:
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.pending_directories.clear()
+        self.pending_records = 0
 
 
 def ask_to_resume(progress_file: Path, volumes: list[UserVolume]) -> bool:
@@ -564,7 +572,7 @@ def ask_to_resume(progress_file: Path, volumes: list[UserVolume]) -> bool:
     return answer not in {"n", "no"}
 
 
-def iter_backup_files(users_root: Path) -> Iterator[Path]:
+def iter_backup_directories(users_root: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
     for root, dirs, files in os.walk(users_root):
         current_root = Path(root)
         dirs[:] = sorted(
@@ -576,10 +584,15 @@ def iter_backup_files(users_root: Path) -> Iterator[Path]:
             ),
             key=str.lower,
         )
-        for file_name in sorted(files, key=str.lower):
-            source_file = current_root / file_name
-            if not source_file.is_symlink():
-                yield source_file
+        visible_files = sorted(
+            (
+                file_name
+                for file_name in files
+                if not (current_root / file_name).is_symlink()
+            ),
+            key=str.lower,
+        )
+        yield current_root, dirs, visible_files
 
 
 def copy_file_atomically(source: Path, destination: Path) -> None:
@@ -596,14 +609,6 @@ def copy_file_atomically(source: Path, destination: Path) -> None:
         with open(temporary_path, "rb") as copied_file:
             os.fsync(copied_file.fileno())
         os.replace(temporary_path, destination)
-        directory_fd = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -622,53 +627,49 @@ def copy_users_to_usb(
     completed_files: dict[str, dict],
 ) -> None:
     windows_volume_count = sum(volume.is_windows_installation for volume in volumes)
-    total_size = sum(get_total_size(volume.root / "Users") for volume in volumes)
-    print(f"Total bytes to copy: {total_size}")
+    print("Starting copy. Progress is shown as bytes transferred; total size is not pre-scanned.")
 
-    with tqdm(total=total_size, unit="B", unit_scale=True, desc="Copying Users") as pbar:
-        for volume in volumes:
-            users_src = volume.root / "Users"
-            users_dst = get_backup_path(volume, windows_volume_count, dst)
-            print(f"Copying {volume.device} Users folder to: {users_dst}")
-            users_dst.mkdir(parents=True, exist_ok=True)
+    with tqdm(
+        total=None,
+        unit="B",
+        unit_scale=True,
+        unit_dynamic=True,
+        desc="Copying Users",
+    ) as pbar, open(progress_file, "a", encoding="utf-8") as progress_handle:
+        journal = ProgressJournal(progress_handle)
+        try:
+            for volume in volumes:
+                users_src = volume.root / "Users"
+                users_dst = get_backup_path(volume, windows_volume_count, dst)
+                print(f"Copying {volume.device} Users folder to: {users_dst}")
 
-            for user_dir in iter_real_user_dirs(users_src):
-                (users_dst / user_dir.relative_to(users_src)).mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
+                for current_root, dirs, files in iter_backup_directories(users_src):
+                    target_dir = users_dst / current_root.relative_to(users_src)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    for directory in dirs:
+                        (target_dir / directory).mkdir(exist_ok=True)
 
-            for root, dirs, _files in os.walk(users_src):
-                current_root = Path(root)
-                dirs[:] = [
-                    directory
-                    for directory in dirs
-                    if directory not in EXCLUDED_DIRS
-                    and not (current_root / directory).is_symlink()
-                ]
-                target_dir = users_dst / current_root.relative_to(users_src)
-                for directory in dirs:
-                    (target_dir / directory).mkdir(parents=True, exist_ok=True)
+                    for file_name in files:
+                        source_file = current_root / file_name
+                        relative_to_users = source_file.relative_to(users_src)
+                        destination = users_dst / relative_to_users
+                        progress_key = f"{volume.identity}/{relative_to_users.as_posix()}"
+                        signature = get_file_signature(source_file)
+                        saved_signature = completed_files.get(progress_key)
 
-            for source_file in iter_backup_files(users_src):
-                relative_to_users = source_file.relative_to(users_src)
-                destination = users_dst / relative_to_users
-                progress_key = f"{volume.identity}/{relative_to_users.as_posix()}"
-                signature = get_file_signature(source_file)
-                saved_signature = completed_files.get(progress_key)
+                        if (
+                            saved_signature == signature
+                            and destination.is_file()
+                            and destination.stat().st_size == signature["size"]
+                        ):
+                            continue
 
-                if (
-                    saved_signature == signature
-                    and destination.is_file()
-                    and destination.stat().st_size == signature["size"]
-                ):
-                    pbar.update(signature["size"])
-                    continue
-
-                copy_file_atomically(source_file, destination)
-                record_completed_file(progress_file, progress_key, signature)
-                completed_files[progress_key] = signature
-                pbar.update(signature["size"])
+                        copy_file_atomically(source_file, destination)
+                        journal.record(progress_key, signature, destination.parent)
+                        completed_files[progress_key] = signature
+                        pbar.update(signature["size"])
+        finally:
+            journal.sync()
 
 
 def main():
