@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,7 +42,7 @@ def find_usb_mountpoint() -> Path:
             continue
         if removable != "1":
             continue
-        if mountpoint and mountpoint != "":  # already mounted USB
+        if mountpoint and mountpoint != "":
             return Path(mountpoint)
         if name.startswith("/dev/"):
             try:
@@ -280,6 +281,26 @@ def find_user_volumes() -> Iterator[list[UserVolume]]:
             os.rmdir(mountpoint)
 
 
+def sanitize_filename(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    return sanitized.strip("._") or "user"
+
+
+def iter_real_user_dirs(users_root: Path) -> list[Path]:
+    if not users_root.is_dir():
+        return []
+
+    user_dirs = []
+    for entry in sorted(users_root.iterdir(), key=lambda p: p.name.lower()):
+        if entry.is_symlink():
+            continue
+        if entry.name in EXCLUDED_DIRS:
+            continue
+        if entry.is_dir():
+            user_dirs.append(entry)
+    return user_dirs
+
+
 def get_total_size(path: Path) -> int:
     total = 0
     for root, dirs, files in os.walk(path):
@@ -289,35 +310,73 @@ def get_total_size(path: Path) -> int:
             if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
         ]
         for file_name in files:
-            total += (Path(root) / file_name).stat().st_size
+            file_path = Path(root) / file_name
+            if file_path.is_symlink():
+                continue
+            total += file_path.stat().st_size
     return total
 
 
-def save_directory_trees(volumes: list[UserVolume], out_file: Path) -> None:
-    with open(out_file, "w", encoding="utf-8", errors="ignore") as f:
-        def walk(current: Path, prefix: str = "") -> None:
-            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
-            for i, entry in enumerate(entries):
-                if entry.name in EXCLUDED_DIRS or entry.is_symlink():
-                    continue
-                connector = "└── " if i == len(entries) - 1 else "├── "
-                line = prefix + connector + entry.name
-                f.write(line + "\n")
+def write_directory_tree(current: Path, handle) -> None:
+    entries = [
+        entry
+        for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
+        if not entry.is_symlink() and entry.name not in EXCLUDED_DIRS
+    ]
 
-                if (
-                    entry.is_dir()
-                    and not entry.is_symlink()
-                    and entry.name not in EXCLUDED_DIRS
-                ):
-                    next_prefix = prefix + ("    " if i == len(entries) - 1 else "│   ")
-                    walk(entry, next_prefix)
+    for index, entry in enumerate(entries):
+        connector = "└── " if index == len(entries) - 1 else "├── "
+        handle.write(f"{connector}{entry.name}\n")
 
-        for volume in volumes:
-            kind = "Windows" if volume.is_windows_installation else "additional disk"
-            heading = f"{volume.device} ({kind})"
-            print(f"\n{heading}")
-            f.write(f"\n{heading}\n")
-            walk(volume.root / "Users")
+        if entry.is_dir():
+            next_prefix = "    " if index == len(entries) - 1 else "│   "
+            child_entries = [
+                child
+                for child in sorted(entry.iterdir(), key=lambda p: p.name.lower())
+                if not child.is_symlink() and child.name not in EXCLUDED_DIRS
+            ]
+            if child_entries:
+                handle.write(f"{next_prefix}...")
+                # We keep the tree output simple and readable by recursing.
+            
+            # The recursive walk below keeps the full directory tree.
+            for child_index, child in enumerate(child_entries):
+                child_connector = "└── " if child_index == len(child_entries) - 1 else "├── "
+                handle.write(f"{next_prefix}{child_connector}{child.name}\n")
+                if child.is_dir():
+                    sub_prefix = next_prefix + ("    " if child_index == len(child_entries) - 1 else "│   ")
+                    _walk(child, handle, sub_prefix)
+
+
+def _walk(current: Path, handle, prefix: str = "") -> None:
+    entries = [
+        entry
+        for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
+        if not entry.is_symlink() and entry.name not in EXCLUDED_DIRS
+    ]
+    for index, entry in enumerate(entries):
+        connector = "└── " if index == len(entries) - 1 else "├── "
+        handle.write(f"{prefix}{connector}{entry.name}\n")
+        if entry.is_dir():
+            next_prefix = prefix + ("    " if index == len(entries) - 1 else "│   ")
+            _walk(entry, handle, next_prefix)
+
+
+def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for volume in volumes:
+        users_root = volume.root / "Users"
+        for user_dir in iter_real_user_dirs(users_root):
+            device_name = Path(volume.device).name or "unknown"
+            file_name = f"{sanitize_filename(device_name)}_{user_dir.name}_tree.txt"
+            tree_path = out_dir / file_name
+
+            with open(tree_path, "w", encoding="utf-8", errors="ignore") as handle:
+                handle.write(f"{user_dir.name}\n")
+                _walk(user_dir, handle)
+
+            print(f"Saved directory tree: {tree_path}")
 
 
 def get_backup_path(volume: UserVolume, windows_volume_count: int, dst: Path) -> Path:
@@ -339,29 +398,32 @@ def copy_users_to_usb(volumes: list[UserVolume], dst: Path) -> None:
             print(f"Copying {volume.device} Users folder to: {users_dst}")
             users_dst.mkdir(parents=True, exist_ok=True)
 
-            for root, dirs, files in os.walk(users_src):
-                dirs[:] = [
-                    directory
-                    for directory in dirs
-                    if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
-                ]
-                current_root = Path(root)
+            for user_dir in iter_real_user_dirs(users_src):
+                src_user = user_dir
+                dst_user = users_dst / src_user.relative_to(users_src)
+                dst_user.mkdir(parents=True, exist_ok=True)
 
-                for directory in dirs:
-                    src_dir = current_root / directory
-                    if not src_dir.exists():
-                        continue
-                    dst_dir = users_dst / src_dir.relative_to(users_src)
-                    dst_dir.mkdir(parents=True, exist_ok=True)
+                for root, dirs, files in os.walk(src_user):
+                    dirs[:] = [
+                        directory
+                        for directory in dirs
+                        if directory not in EXCLUDED_DIRS and not (Path(root) / directory).is_symlink()
+                    ]
+                    current_root = Path(root)
 
-                for file_name in files:
-                    src_file = current_root / file_name
-                    if not src_file.exists():
-                        continue
-                    dst_file = users_dst / src_file.relative_to(users_src)
-                    dst_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, dst_file)
-                    pbar.update(src_file.stat().st_size)
+                    for directory in dirs:
+                        src_dir = current_root / directory
+                        dst_dir = users_dst / src_dir.relative_to(users_src)
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+
+                    for file_name in files:
+                        src_file = current_root / file_name
+                        if src_file.is_symlink():
+                            continue
+                        dst_file = users_dst / src_file.relative_to(users_src)
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+                        pbar.update(src_file.stat().st_size)
 
 
 def main():
@@ -373,20 +435,17 @@ def main():
 
     print(f"Using backup target: {USB}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    TREE_FILE = OUT_DIR / "windows_users_tree.txt"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         with find_user_volumes() as volumes:
             print(f"Found {len(volumes)} volume(s) with a Users folder.")
-            print("Saving directory tree to:", TREE_FILE)
-            save_directory_trees(volumes, TREE_FILE)
+            save_directory_trees(volumes, OUT_DIR)
 
             print("\nCopying user folders to USB...")
             copy_users_to_usb(volumes, OUT_DIR)
 
             print("\nDone.")
-            print(f"Tree file saved to: {TREE_FILE}")
+            print(f"Tree files saved to: {OUT_DIR}")
             print(f"Backup saved to: {OUT_DIR}")
     except (FileNotFoundError, RuntimeError) as error:
         print(error, file=sys.stderr)
