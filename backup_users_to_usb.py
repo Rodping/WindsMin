@@ -411,7 +411,8 @@ def iter_real_user_dirs(users_root: Path) -> list[Path]:
     return user_dirs
 
 
-def write_directory_tree(current: Path, handle, prefix: str = "") -> None:
+def write_directory_tree(current: Path, handle, prefix: str = "") -> int:
+    file_count = 0
     entries = [
         entry
         for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
@@ -422,11 +423,15 @@ def write_directory_tree(current: Path, handle, prefix: str = "") -> None:
         handle.write(f"{prefix}{connector}{entry.name}\n")
         if entry.is_dir():
             next_prefix = prefix + ("    " if index == len(entries) - 1 else "│   ")
-            write_directory_tree(entry, handle, next_prefix)
+            file_count += write_directory_tree(entry, handle, next_prefix)
+        elif entry.is_file():
+            file_count += 1
+    return file_count
 
 
-def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> None:
+def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
+    total_files = 0
 
     for volume in volumes:
         users_root = volume.root / "Users"
@@ -437,9 +442,10 @@ def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> None:
 
             with open(tree_path, "w", encoding="utf-8", errors="ignore") as handle:
                 handle.write(f"{user_dir.name}\n")
-                write_directory_tree(user_dir, handle)
+                total_files += write_directory_tree(user_dir, handle)
 
             print(f"Saved directory tree: {tree_path}")
+    return total_files
 
 
 def get_backup_path(volume: UserVolume, windows_volume_count: int, dst: Path) -> Path:
@@ -625,16 +631,17 @@ def copy_users_to_usb(
     dst: Path,
     progress_file: Path,
     completed_files: dict[str, dict],
+    total_files: int,
 ) -> None:
     windows_volume_count = sum(volume.is_windows_installation for volume in volumes)
-    print("Starting copy. Progress is shown as bytes transferred; total size is not pre-scanned.")
+    print(f"Copying {total_files:,} files. Progress updates about every 3 seconds.")
 
     with tqdm(
-        total=None,
-        unit="B",
-        unit_scale=True,
-        unit_dynamic=True,
+        total=total_files,
+        unit="file",
         desc="Copying Users",
+        mininterval=3,
+        dynamic_ncols=True,
     ) as pbar, open(progress_file, "a", encoding="utf-8") as progress_handle:
         journal = ProgressJournal(progress_handle)
         try:
@@ -662,12 +669,13 @@ def copy_users_to_usb(
                             and destination.is_file()
                             and destination.stat().st_size == signature["size"]
                         ):
+                            pbar.update(1)
                             continue
 
                         copy_file_atomically(source_file, destination)
                         journal.record(progress_key, signature, destination.parent)
                         completed_files[progress_key] = signature
-                        pbar.update(signature["size"])
+                        pbar.update(1)
         finally:
             journal.sync()
 
@@ -705,10 +713,16 @@ def main():
                 completed_files = {}
 
             remove_abandoned_temporary_files(out_dir)
-            save_directory_trees(volumes, out_dir)
+            total_files = save_directory_trees(volumes, out_dir)
 
             print("\nCopying user folders to USB...")
-            copy_users_to_usb(volumes, out_dir, progress_file, completed_files)
+            copy_users_to_usb(
+                volumes,
+                out_dir,
+                progress_file,
+                completed_files,
+                total_files,
+            )
 
             progress_file.unlink(missing_ok=True)
             print("\nBackup completed.")

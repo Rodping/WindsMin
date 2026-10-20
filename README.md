@@ -125,7 +125,9 @@ are not deleted.
 - Alpine Linux with permission to inspect and mount disks (normally run as
   `root`).
 - `lsblk`, `findmnt`, `mount`, and `umount` from `util-linux`.
-- Python 3 and the Python `tqdm` progress-bar package.
+- Python 3 and the Python `tqdm` progress-bar package, installed on Alpine as
+  `python3` and `py3-tqdm`.
+- `git`, used by the launcher to update this repository.
 - Filesystem support for the source partitions. The script considers NTFS,
   exFAT, FAT, ext2/3/4, Btrfs, and XFS partitions. NTFS mounting tries the
   `ntfs3` driver and then `ntfs-3g`.
@@ -140,11 +142,13 @@ From the project directory, run:
 sh backup.sh
 ```
 
-`backup.sh` installs `python3`, `util-linux`, `ntfs-3g`, and `py3-tqdm` with
-`apk`, pulls the latest project changes with `git pull`, then starts the Python
-script. Package installation and `git pull` require network access. You can run
-`python3 backup_users_to_usb.py` directly if those dependencies are already
-installed.
+`backup.sh` installs `python3`, `py3-tqdm`, `util-linux`, `ntfs-3g`, and `git`
+with Alpine's `apk` package manager, pulls the latest project changes with
+`git pull`, then starts the Python script. The script's required Python
+dependency (`tqdm`) is installed as Alpine's `py3-tqdm` package; it does not
+need `pip install`. Package installation and `git pull` require network access.
+You can run `python3 backup_users_to_usb.py` directly if the requirements are
+already installed.
 
 The source partitions that the script mounts itself are mounted read-only.
 Already-mounted source partitions keep their existing mount mode.
@@ -176,11 +180,11 @@ backup and does not save the copied profile files.
 
 ## Speed and progress display
 
-The script does not first scan all files just to calculate a total size. It
-creates the requested directory-tree reports, then copies files in a single
-pass using Python's optimized file-copy routines. Progress shows bytes copied
-so far rather than a percentage or estimated time, because calculating an
-exact percentage would require an extra full scan and stat of the source files.
+The progress bar shows the percentage and number of files copied, refreshing
+about every three seconds. The script counts files while creating the directory
+tree reports, so it does not need an additional full scan just to calculate the
+percentage. It then copies files using Python's optimized file-copy routines.
+The progress bar is updated in the main copy loop; no extra thread is needed.
 Copy speed still depends on the source disk, USB port, and flash drive.
 
 ## License
