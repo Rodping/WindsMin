@@ -150,6 +150,12 @@ need `pip install`. Package installation and `git pull` require network access.
 You can run `python3 backup_users_to_usb.py` directly if the requirements are
 already installed.
 
+The current script does not require `/mnt/usb`; it selects the data partition
+and mounts it under `/mnt/windsmin-backup-<device>` if needed. If you see the
+message `USB not mounted: /mnt/usb`, the older script is still being run. Check
+that the repository is on the branch containing automatic backup-partition
+detection and that `git pull` actually updated it before running the backup.
+
 The source partitions that the script mounts itself are mounted read-only.
 Already-mounted source partitions keep their existing mount mode.
 

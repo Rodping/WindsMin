@@ -22,6 +22,7 @@ except ImportError:
 
 BOOT_PARTITION_MAX_SIZE = 3 * 1024**3
 DATA_PARTITION_MIN_SIZE = 4 * 1024**3
+SYS_BLOCK_PATH = Path("/sys/class/block")
 WRITABLE_FILESYSTEMS = {
     "exfat",
     "vfat",
@@ -96,9 +97,22 @@ def find_script_partition(partitions: list[dict]) -> dict | None:
 
 
 def is_removable_disk(partition: dict) -> bool:
-    return str(partition.get("_parent_rm", "")).lower() in {"1", "true"} or (
-        str(partition.get("_parent_tran", "")).lower() == "usb"
-    )
+    if str(partition.get("_parent_rm", "")).lower() in {"1", "true"}:
+        return True
+    if str(partition.get("_parent_tran", "")).lower() == "usb":
+        return True
+
+    parent_name = partition.get("_parent_name")
+    if not parent_name:
+        return False
+
+    sysfs_device = SYS_BLOCK_PATH / Path(parent_name).name / "device"
+    try:
+        device_path = sysfs_device.resolve(strict=True)
+    except OSError:
+        return False
+
+    return any(part.lower().startswith("usb") for part in device_path.parts)
 
 
 def get_backup_partition(partitions: list[dict]) -> dict:
