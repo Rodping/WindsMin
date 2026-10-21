@@ -3,14 +3,18 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
+import time
+import tty
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, Iterator
+from typing import Callable, Generator, Iterator
 
 try:
     from tqdm import tqdm
@@ -50,9 +54,59 @@ class BackupSummary:
         self.file_count += 1
         self.total_bytes += size
 
-    def add(self, other: "BackupSummary") -> None:
-        self.file_count += other.file_count
-        self.total_bytes += other.total_bytes
+
+class SkipCurrentUser(Exception):
+    pass
+
+
+class CtrlSpaceSkipListener:
+    def __init__(self) -> None:
+        self.file_descriptor: int | None = None
+        self.original_terminal_settings = None
+        self.available = False
+        self.last_poll = 0.0
+
+    def start(self) -> None:
+        if not sys.stdin.isatty():
+            return
+
+        self.file_descriptor = sys.stdin.fileno()
+        self.original_terminal_settings = termios.tcgetattr(self.file_descriptor)
+        tty.setcbreak(self.file_descriptor)
+        self.available = True
+
+    def stop(self) -> None:
+        if self.original_terminal_settings is not None:
+            termios.tcsetattr(
+                self.file_descriptor,
+                termios.TCSADRAIN,
+                self.original_terminal_settings,
+            )
+            self.original_terminal_settings = None
+
+    def skip_requested(self) -> bool:
+        if not self.available or self.file_descriptor is None:
+            return False
+
+        now = time.monotonic()
+        if now - self.last_poll < 0.1:
+            return False
+        self.last_poll = now
+
+        readable, _, _ = select.select([self.file_descriptor], [], [], 0)
+        if not readable:
+            return False
+        return os.read(self.file_descriptor, 1) == b"\x00"
+
+
+@contextmanager
+def capture_ctrl_space() -> Generator[CtrlSpaceSkipListener, None, None]:
+    listener = CtrlSpaceSkipListener()
+    listener.start()
+    try:
+        yield listener
+    finally:
+        listener.stop()
 
 
 def list_partitions() -> list[dict]:
@@ -98,6 +152,8 @@ def detect_bitlocker_partitions(partitions: list[dict]) -> list[dict]:
         filesystem = str(partition.get("fstype") or "").strip().casefold()
         if filesystem in BITLOCKER_FILESYSTEMS:
             detected.append(partition)
+            continue
+        if filesystem:
             continue
 
         try:
@@ -540,41 +596,69 @@ def iter_real_user_dirs(users_root: Path) -> list[Path]:
         return []
 
     user_dirs = []
-    for entry in sorted(users_root.iterdir(), key=lambda p: p.name.lower()):
-        if entry.is_symlink():
-            continue
-        if entry.name in EXCLUDED_DIRS:
-            continue
-        if entry.is_dir():
-            user_dirs.append(entry)
-    return user_dirs
+    with os.scandir(users_root) as entries:
+        for entry in entries:
+            if entry.name in EXCLUDED_DIRS:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                user_dirs.append(Path(entry.path))
+    return sorted(user_dirs, key=lambda path: path.name.lower())
 
 
 def write_directory_tree(
     current: Path,
     handle,
+    summary: BackupSummary,
     prefix: str = "",
-) -> BackupSummary:
-    summary = BackupSummary()
-    entries = [
-        entry
-        for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
-        if not entry.is_symlink() and entry.name not in EXCLUDED_DIRS
-    ]
+    skip_check: Callable[[], bool] | None = None,
+) -> None:
+    if skip_check is not None and skip_check():
+        raise SkipCurrentUser
+
+    with os.scandir(current) as scan:
+        entries = sorted(
+            (
+                entry
+                for entry in scan
+                if entry.name not in EXCLUDED_DIRS and not entry.is_symlink()
+            ),
+            key=lambda entry: entry.name.lower(),
+        )
+
     for index, entry in enumerate(entries):
+        if skip_check is not None and skip_check():
+            raise SkipCurrentUser
         connector = "└── " if index == len(entries) - 1 else "├── "
         handle.write(f"{prefix}{connector}{entry.name}\n")
-        if entry.is_dir():
+        if entry.is_dir(follow_symlinks=False):
             next_prefix = prefix + ("    " if index == len(entries) - 1 else "│   ")
-            summary.add(write_directory_tree(entry, handle, next_prefix))
-        elif entry.is_file():
-            summary.add_file(entry.stat().st_size)
-    return summary
+            write_directory_tree(entry, handle, summary, next_prefix, skip_check)
+        elif entry.is_file(follow_symlinks=False):
+            summary.add_file(entry.stat(follow_symlinks=False).st_size)
+
+    if skip_check is not None and skip_check():
+        raise SkipCurrentUser
 
 
-def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> BackupSummary:
+def save_directory_trees(
+    volumes: list[UserVolume],
+    out_dir: Path,
+    skip_listener: CtrlSpaceSkipListener,
+    skipped_users: set[tuple[str, str]],
+) -> BackupSummary:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = BackupSummary()
+
+    if skip_listener.available:
+        print(
+            "While a user tree is being scanned, press Ctrl+Space to skip that "
+            "user's tree and file copy."
+        )
+    else:
+        print(
+            "Ctrl+Space skipping is unavailable because stdin is not an "
+            "interactive terminal."
+        )
 
     for volume in volumes:
         users_root = volume.root / "Users"
@@ -582,11 +666,46 @@ def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> BackupSumm
             device_name = Path(volume.device).name or "unknown"
             file_name = f"{sanitize_filename(device_name)}_{user_dir.name}_tree.txt"
             tree_path = out_dir / file_name
+            user_summary = BackupSummary()
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix=".windsmin-tree-",
+                suffix=".partial",
+                dir=out_dir,
+            )
+            temp_path = Path(temp_name)
 
-            with open(tree_path, "w", encoding="utf-8", errors="ignore") as handle:
-                handle.write(f"{user_dir.name}\n")
-                summary.add(write_directory_tree(user_dir, handle))
+            print(
+                f"Now scanning user '{user_dir.name}'. "
+                "Ctrl+Space skips this user's tree and file copy.",
+                flush=True,
+            )
+            try:
+                with os.fdopen(
+                    temp_fd,
+                    "w",
+                    encoding="utf-8",
+                    errors="ignore",
+                ) as handle:
+                    handle.write(f"{user_dir.name}\n")
+                    write_directory_tree(
+                        user_dir,
+                        handle,
+                        user_summary,
+                        skip_check=skip_listener.skip_requested,
+                    )
+                os.replace(temp_path, tree_path)
+            except SkipCurrentUser:
+                skipped_users.add((volume.identity, user_dir.name))
+                print(
+                    f"Skipped user '{user_dir.name}': no tree or files will be "
+                    "copied for this user in this run."
+                )
+                continue
+            finally:
+                temp_path.unlink(missing_ok=True)
 
+            summary.file_count += user_summary.file_count
+            summary.total_bytes += user_summary.total_bytes
             print(f"Saved directory tree: {tree_path}")
     return summary
 
@@ -604,48 +723,49 @@ def get_source_backup_dir(volumes: list[UserVolume], out_dir: Path) -> Path:
     return out_dir / f"source_{fingerprint}"
 
 
-def get_file_signature(path: Path) -> dict[str, int]:
-    stat = path.stat()
-    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
 def load_completed_files(progress_file: Path, source_ids: list[str]) -> dict[str, dict]:
-    lines = progress_file.read_text(encoding="utf-8").splitlines()
-    if not lines:
-        raise RuntimeError(f"Resume file is empty and cannot be read: {progress_file}")
-
-    try:
-        header = json.loads(lines[0])
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"Resume file has an invalid header: {progress_file}") from error
-
-    if header.get("type") != "header" or header.get("source_ids") != source_ids:
-        raise RuntimeError(
-            "The saved progress belongs to a different source disk set. "
-            "Refusing to resume it."
-        )
-
     completed = {}
-    for index, line in enumerate(lines[1:], start=1):
+    with open(progress_file, encoding="utf-8") as handle:
+        first_line = handle.readline()
+        if not first_line:
+            raise RuntimeError(f"Resume file is empty and cannot be read: {progress_file}")
+
         try:
-            record = json.loads(line)
+            header = json.loads(first_line)
         except json.JSONDecodeError as error:
-            if index == len(lines) - 1:
-                print("Ignoring an incomplete final resume record.", file=sys.stderr)
-                continue
             raise RuntimeError(
-                f"Resume file contains invalid data on line {index + 1}: {progress_file}"
+                f"Resume file has an invalid header: {progress_file}"
             ) from error
-        if record.get("type") == "file":
+
+        if header.get("type") != "header" or header.get("source_ids") != source_ids:
+            raise RuntimeError(
+                "The saved progress belongs to a different source disk set. "
+                "Refusing to resume it."
+            )
+
+        for line_number, line in enumerate(handle, start=2):
             try:
-                completed[record["path"]] = {
-                    "size": record["size"],
-                    "mtime_ns": record["mtime_ns"],
-                }
-            except KeyError as error:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                if not line.endswith("\n"):
+                    print("Ignoring an incomplete final resume record.", file=sys.stderr)
+                    continue
                 raise RuntimeError(
-                    f"Resume file contains an incomplete record on line {index + 1}."
+                    f"Resume file contains invalid data on line {line_number}: "
+                    f"{progress_file}"
                 ) from error
+
+            if record.get("type") == "file":
+                try:
+                    completed[record["path"]] = {
+                        "size": record["size"],
+                        "mtime_ns": record["mtime_ns"],
+                    }
+                except KeyError as error:
+                    raise RuntimeError(
+                        f"Resume file contains an incomplete record on line "
+                        f"{line_number}."
+                    ) from error
     return completed
 
 
@@ -721,27 +841,34 @@ def ask_to_resume(progress_file: Path, volumes: list[UserVolume]) -> bool:
     return answer not in {"n", "no"}
 
 
-def iter_backup_directories(users_root: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
-    for root, dirs, files in os.walk(users_root):
-        current_root = Path(root)
-        dirs[:] = sorted(
-            (
-                directory
-                for directory in dirs
-                if directory not in EXCLUDED_DIRS
-                and not (current_root / directory).is_symlink()
-            ),
-            key=str.lower,
-        )
-        visible_files = sorted(
-            (
-                file_name
-                for file_name in files
-                if not (current_root / file_name).is_symlink()
-            ),
-            key=str.lower,
-        )
-        yield current_root, dirs, visible_files
+def iter_backup_directories(
+    users_root: Path,
+    skipped_user_dirs: set[str] | None = None,
+) -> Iterator[tuple[Path, list[os.DirEntry[str]], list[os.DirEntry[str]]]]:
+    pending = [users_root]
+    while pending:
+        current_root = pending.pop()
+        with os.scandir(current_root) as scan:
+            entries = list(scan)
+
+        directories = []
+        files = []
+        for entry in entries:
+            if entry.name in EXCLUDED_DIRS or entry.is_symlink():
+                continue
+            if (
+                current_root == users_root
+                and skipped_user_dirs is not None
+                and entry.name in skipped_user_dirs
+            ):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                directories.append(entry)
+            elif entry.is_file(follow_symlinks=False):
+                files.append(entry)
+
+        yield current_root, directories, files
+        pending.extend(Path(entry.path) for entry in reversed(directories))
 
 
 def copy_file_atomically(source: Path, destination: Path) -> None:
@@ -766,7 +893,10 @@ def remove_abandoned_temporary_files(out_dir: Path) -> None:
     for root, dirs, files in os.walk(out_dir):
         dirs.sort()
         for file_name in files:
-            if file_name.startswith(".windsmin-copy-") and file_name.endswith(".partial"):
+            if (
+                file_name.startswith((".windsmin-copy-", ".windsmin-tree-"))
+                and file_name.endswith(".partial")
+            ):
                 (Path(root) / file_name).unlink(missing_ok=True)
 
 
@@ -776,6 +906,7 @@ def copy_users_to_usb(
     progress_file: Path,
     completed_files: dict[str, dict],
     total_bytes: int,
+    skipped_users: set[tuple[str, str]],
 ) -> None:
     windows_volume_count = sum(volume.is_windows_installation for volume in volumes)
     print("Copying files. Progress is shown as a percentage and refreshes every 3 seconds.")
@@ -793,19 +924,31 @@ def copy_users_to_usb(
                 users_src = volume.root / "Users"
                 users_dst = get_backup_path(volume, windows_volume_count, dst)
                 print(f"Copying {volume.device} Users folder to: {users_dst}")
+                skipped_user_dirs = {
+                    user_name
+                    for identity, user_name in skipped_users
+                    if identity == volume.identity
+                }
 
-                for current_root, dirs, files in iter_backup_directories(users_src):
+                for current_root, dirs, files in iter_backup_directories(
+                    users_src,
+                    skipped_user_dirs,
+                ):
                     target_dir = users_dst / current_root.relative_to(users_src)
                     target_dir.mkdir(parents=True, exist_ok=True)
                     for directory in dirs:
-                        (target_dir / directory).mkdir(exist_ok=True)
+                        (target_dir / directory.name).mkdir(exist_ok=True)
 
-                    for file_name in files:
-                        source_file = current_root / file_name
+                    for file_entry in files:
+                        source_file = Path(file_entry.path)
+                        source_stat = file_entry.stat(follow_symlinks=False)
                         relative_to_users = source_file.relative_to(users_src)
                         destination = users_dst / relative_to_users
                         progress_key = f"{volume.identity}/{relative_to_users.as_posix()}"
-                        signature = get_file_signature(source_file)
+                        signature = {
+                            "size": source_stat.st_size,
+                            "mtime_ns": source_stat.st_mtime_ns,
+                        }
                         saved_signature = completed_files.get(progress_key)
 
                         if (
@@ -860,12 +1003,24 @@ def main():
                 completed_files = {}
 
             remove_abandoned_temporary_files(out_dir)
-            summary = save_directory_trees(volumes, out_dir)
+            skipped_users: set[tuple[str, str]] = set()
+            with capture_ctrl_space() as skip_listener:
+                summary = save_directory_trees(
+                    volumes,
+                    out_dir,
+                    skip_listener,
+                    skipped_users,
+                )
             required_gib = summary.total_bytes / (1024**3)
             print(
                 f"Backup size: {required_gib:.2f} GiB "
                 f"({summary.file_count:,} files)."
             )
+            if skipped_users:
+                skipped_names = ", ".join(
+                    sorted(user_name for _, user_name in skipped_users)
+                )
+                print(f"Skipped users for this run: {skipped_names}")
 
             print("\nCopying user folders to USB...")
             copy_users_to_usb(
@@ -874,6 +1029,7 @@ def main():
                 progress_file,
                 completed_files,
                 summary.total_bytes,
+                skipped_users,
             )
 
             progress_file.unlink(missing_ok=True)

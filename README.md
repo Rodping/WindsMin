@@ -89,7 +89,7 @@ Backups are stored in a `windows_backup` directory on the selected partition:
 
 ```text
 <backup partition>/windows_backup/
-└── source_<disk-id>/
+└── source_<disk-set-id>/
     ├── Users/                          # Profiles from one Windows installation
     ├── OtherVolumes/<device>/Users/     # Profiles from other volumes/installations
     └── <device>_<user>_tree.txt         # One directory tree per profile
@@ -132,10 +132,18 @@ The source-specific directory is based on the attached source volume IDs, so
 backups from different PCs with different disk IDs are kept separately. If a
 disk does not provide a filesystem UUID, the Linux device name is used as a
 fallback; in that case, the script cannot reliably recognize the same disk
-after its device name changes. Disconnect other computers' source disks while
-resuming, and make sure the original source disk is attached. If you choose to
-start over, existing copied files are overwritten as needed; unrelated files
-are not deleted.
+after its device name changes. The directory name is a hash of the whole set of
+source volume IDs, not the computer name. Therefore, separate PCs normally get
+separate directories, but replacing a disk can create a new directory and
+cloned disks with identical IDs can share one. Disconnect other computers'
+source disks while resuming, and make sure the original source disk is
+attached. If you choose to start over, existing copied files are overwritten
+as needed; unrelated files are not deleted.
+
+While a user's directory tree is being scanned, the screen shows which user
+can be skipped. Press `Ctrl+Space` to omit that user's tree and files from this
+run. This requires an interactive terminal. If a previous run already copied
+that user's files, skipping does not delete those older files from the backup.
 
 ## Requirements
 
@@ -164,7 +172,9 @@ sh backup.sh
 and `git` with Alpine's `apk` package manager, pulls the latest project changes
 with `git pull`, then starts the Python script. The script's required Python
 dependency (`tqdm`) is installed as Alpine's `py3-tqdm` package; it does not
-need `pip install`. Package installation and `git pull` require network access.
+need `pip install`. All other Python imports use the Python standard library,
+so no additional pip packages are needed. Package installation and `git pull`
+require network access.
 You can run `python3 backup_users_to_usb.py` directly if the requirements are
 already installed.
 
@@ -210,6 +220,12 @@ contents or doing an extra directory scan. During copying, the progress bar
 shows only the percentage and refreshes about every three seconds. It is
 updated in the main copy loop; no extra thread is needed. Copy speed still
 depends on the source disk, USB port, and flash drive.
+
+The directory-tree pass uses `os.scandir` metadata to count file sizes while
+listing entries. The copy pass uses the same operating-system directory
+iteration API without sorting entries, avoiding extra metadata lookups and
+sorting work when a profile contains many files. Resume records are read
+incrementally rather than loading the entire log as text into memory.
 
 ## License
 
