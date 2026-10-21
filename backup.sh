@@ -1,7 +1,13 @@
 #!/bin/sh
 set -eu
 
-apk add --no-cache python3 py3-tqdm util-linux ntfs-3g git
+apk add --no-cache \
+    python3 \
+    py3-tqdm \
+    util-linux \
+    blkid \
+    ntfs-3g \
+    git
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 git -C "$SCRIPT_DIR" pull

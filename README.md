@@ -20,6 +20,22 @@ authorized backups and recovery.
 4. Writes a tree of the detected `Users` folders and copies profile files to
    the backup drive.
 
+At startup it also checks the attached partitions for BitLocker metadata and
+prints a highly visible warning if it finds any. It continues with other
+readable volumes, but cannot copy data from a BitLocker volume while it is
+locked. Unlock it in Windows or with an authorized recovery method first; do
+not format it. The detection uses the filesystem type reported by `lsblk` and
+the `blkid` probe from Alpine's `blkid` package. See the
+[util-linux BitLocker probe](https://github.com/util-linux/util-linux/blob/master/libblkid/src/superblocks/bitlocker.c).
+
+The script checks whether Alpine exposes a TPM device through
+`/sys/class/tpm` or `/dev/tpm*`. It reports a TPM interface as detected or
+not detected. A missing interface does not prove that the computer has no TPM:
+the firmware may disable it or the running Alpine kernel may lack its driver.
+Detecting a TPM also does not prove BitLocker is configured to use it.
+The kernel documents the
+[TPM sysfs interface](https://github.com/torvalds/linux/blob/master/Documentation/ABI/stable/sysfs-class-tpm).
+
 It searches supported local disk partitions, not just Windows drive letters.
 Windows letters such as `C:`, `D:`, and `H:` are not used by Alpine; Linux
 identifies partitions by device names such as `/dev/sda2` or `/dev/nvme0n1p3`.
@@ -73,7 +89,7 @@ Backups are stored in a `windows_backup` directory on the selected partition:
 
 ```text
 <backup partition>/windows_backup/
-└── source_<disk-id>/
+└── source_<disk-set-id>/
     ├── Users/                          # Profiles from one Windows installation
     ├── OtherVolumes/<device>/Users/     # Profiles from other volumes/installations
     └── <device>_<user>_tree.txt         # One directory tree per profile
@@ -116,16 +132,25 @@ The source-specific directory is based on the attached source volume IDs, so
 backups from different PCs with different disk IDs are kept separately. If a
 disk does not provide a filesystem UUID, the Linux device name is used as a
 fallback; in that case, the script cannot reliably recognize the same disk
-after its device name changes. Disconnect other computers' source disks while
-resuming, and make sure the original source disk is attached. If you choose to
-start over, existing copied files are overwritten as needed; unrelated files
-are not deleted.
+after its device name changes. The directory name is a hash of the whole set of
+source volume IDs, not the computer name. Therefore, separate PCs normally get
+separate directories, but replacing a disk can create a new directory and
+cloned disks with identical IDs can share one. Disconnect other computers'
+source disks while resuming, and make sure the original source disk is
+attached. If you choose to start over, existing copied files are overwritten
+as needed; unrelated files are not deleted.
+
+While a user's directory tree is being scanned, the screen shows which user
+can be skipped. Press `Ctrl+Space` to omit that user's tree and files from this
+run. This requires an interactive terminal. If a previous run already copied
+that user's files, skipping does not delete those older files from the backup.
 
 ## Requirements
 
 - Alpine Linux with permission to inspect and mount disks (normally run as
   `root`).
-- `lsblk`, `findmnt`, `mount`, and `umount` from `util-linux`.
+- `lsblk`, `findmnt`, `mount`, and `umount` from `util-linux`, plus Alpine's
+  `blkid` package for BitLocker detection.
 - Python 3 and the Python `tqdm` progress-bar package, installed on Alpine as
   `python3` and `py3-tqdm`.
 - `git`, used by the launcher to update this repository.
@@ -143,11 +168,13 @@ From the project directory, run:
 sh backup.sh
 ```
 
-`backup.sh` installs `python3`, `py3-tqdm`, `util-linux`, `ntfs-3g`, and `git`
-with Alpine's `apk` package manager, pulls the latest project changes with
-`git pull`, then starts the Python script. The script's required Python
+`backup.sh` installs `python3`, `py3-tqdm`, `util-linux`, `blkid`, `ntfs-3g`,
+and `git` with Alpine's `apk` package manager, pulls the latest project changes
+with `git pull`, then starts the Python script. The script's required Python
 dependency (`tqdm`) is installed as Alpine's `py3-tqdm` package; it does not
-need `pip install`. Package installation and `git pull` require network access.
+need `pip install`. All other Python imports use the Python standard library,
+so no additional pip packages are needed. Package installation and `git pull`
+require network access.
 You can run `python3 backup_users_to_usb.py` directly if the requirements are
 already installed.
 
@@ -187,12 +214,18 @@ backup and does not save the copied profile files.
 
 ## Speed and progress display
 
-The progress bar shows the percentage and number of files copied, refreshing
-about every three seconds. The script counts files while creating the directory
-tree reports, so it does not need an additional full scan just to calculate the
-percentage. It then copies files using Python's optimized file-copy routines.
-The progress bar is updated in the main copy loop; no extra thread is needed.
-Copy speed still depends on the source disk, USB port, and flash drive.
+Before copying, the script prints the total data size in GiB. It calculates
+that size while creating the directory-tree reports, without reading the file
+contents or doing an extra directory scan. During copying, the progress bar
+shows only the percentage and refreshes about every three seconds. It is
+updated in the main copy loop; no extra thread is needed. Copy speed still
+depends on the source disk, USB port, and flash drive.
+
+The directory-tree pass uses `os.scandir` metadata to count file sizes while
+listing entries. The copy pass uses the same operating-system directory
+iteration API without sorting entries, avoiding extra metadata lookups and
+sorting work when a profile contains many files. Resume records are read
+incrementally rather than loading the entire log as text into memory.
 
 ## License
 
