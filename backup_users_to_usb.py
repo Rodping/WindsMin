@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Generator, Iterator
 
 try:
     from tqdm import tqdm
@@ -23,6 +23,9 @@ except ImportError:
 BOOT_PARTITION_MAX_SIZE = 3 * 1024**3
 DATA_PARTITION_MIN_SIZE = 10 * 1024**3
 SYS_BLOCK_PATH = Path("/sys/class/block")
+SYS_TPM_PATH = Path("/sys/class/tpm")
+DEV_PATH = Path("/dev")
+BITLOCKER_FILESYSTEMS = {"bitlocker"}
 WRITABLE_FILESYSTEMS = {
     "exfat",
     "vfat",
@@ -36,6 +39,20 @@ WRITABLE_FILESYSTEMS = {
     "btrfs",
     "xfs",
 }
+
+
+@dataclass
+class BackupSummary:
+    file_count: int = 0
+    total_bytes: int = 0
+
+    def add_file(self, size: int) -> None:
+        self.file_count += 1
+        self.total_bytes += size
+
+    def add(self, other: "BackupSummary") -> None:
+        self.file_count += other.file_count
+        self.total_bytes += other.total_bytes
 
 
 def list_partitions() -> list[dict]:
@@ -73,6 +90,98 @@ def list_partitions() -> list[dict]:
 
     walk(json.loads(result.stdout).get("blockdevices", []))
     return partitions
+
+
+def detect_bitlocker_partitions(partitions: list[dict]) -> list[dict]:
+    detected = []
+    for partition in partitions:
+        filesystem = str(partition.get("fstype") or "").strip().casefold()
+        if filesystem in BITLOCKER_FILESYSTEMS:
+            detected.append(partition)
+            continue
+
+        try:
+            result = subprocess.run(
+                ["blkid", "-p", "-s", "TYPE", "-o", "value", partition["name"]],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"BitLocker probe timed out for {partition['name']}."
+            ) from error
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "The blkid utility is required for BitLocker detection. "
+                "Install Alpine's blkid package and try again."
+            ) from error
+
+        if (
+            result.returncode == 0
+            and result.stdout.strip().casefold() in BITLOCKER_FILESYSTEMS
+        ):
+            partition["fstype"] = "BitLocker"
+            detected.append(partition)
+    return detected
+
+
+def detect_tpm_devices(
+    sys_tpm_path: Path = SYS_TPM_PATH,
+    dev_path: Path = DEV_PATH,
+) -> list[str]:
+    devices = []
+    for tpm_path in sorted(sys_tpm_path.glob("tpm[0-9]*")):
+        if not re.fullmatch(r"tpm\d+", tpm_path.name):
+            continue
+        enabled_path = tpm_path / "device" / "enabled"
+        if enabled_path.is_file():
+            state = "enabled" if enabled_path.read_text(encoding="ascii").strip() == "1" else "disabled"
+        else:
+            state = "status unavailable"
+        devices.append(f"{tpm_path.name} ({state})")
+
+    if devices:
+        return devices
+
+    for device_path in sorted(dev_path.glob("tpm[0-9]*")):
+        if re.fullmatch(r"tpm\d+", device_path.name):
+            devices.append(f"{device_path}")
+    return devices
+
+
+def print_hardware_security_status(bitlocker_partitions: list[dict]) -> None:
+    tpm_devices = detect_tpm_devices()
+    if tpm_devices:
+        print("TPM: Alpine detected " + ", ".join(tpm_devices) + ".")
+        print("     This does not confirm that BitLocker is using this TPM.")
+    else:
+        print(
+            "TPM: No TPM interface detected by Alpine. It may be absent, disabled "
+            "in firmware, or unsupported by the running kernel."
+        )
+
+    if not bitlocker_partitions:
+        print("BitLocker: No BitLocker volumes detected.")
+        return
+
+    warning = (
+        "\n"
+        + "!" * 76
+        + "\n!!! BITLOCKER ENCRYPTION DETECTED - BACKUP CANNOT READ LOCKED FILES !!!\n"
+        + "!" * 76
+    )
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+        warning = f"\033[1;31m{warning}\033[0m"
+    print(warning)
+    for partition in bitlocker_partitions:
+        print(f"  Encrypted volume: {partition['name']}")
+    print(
+        "Do not format or repair these volumes. Unlock them in Windows or with an "
+        "authorized recovery method before attempting to back up their files."
+    )
+    print("The script will continue checking other readable volumes.\n")
 
 
 def is_path_inside(path: Path, directory: Path) -> bool:
@@ -182,8 +291,9 @@ def is_mount_read_write(path: Path) -> bool:
     return result.returncode == 0 and "rw" in result.stdout.strip().split(",")
 
 
-def resolve_backup_root() -> Path:
-    partitions = list_partitions()
+def resolve_backup_root(partitions: list[dict] | None = None) -> Path:
+    if partitions is None:
+        partitions = list_partitions()
     partition = get_backup_partition(partitions)
     device = partition["name"]
     if partition.get("fstype") == "vfat":
@@ -338,8 +448,11 @@ def is_backup_volume(mountpoint: Path) -> bool:
 
 
 @contextmanager
-def find_user_volumes() -> Iterator[list[UserVolume]]:
-    partitions = list_partitions()
+def find_user_volumes(
+    partitions: list[dict] | None = None,
+) -> Generator[list[UserVolume], None, None]:
+    if partitions is None:
+        partitions = list_partitions()
     temporary_mounts = []
     user_volumes = []
     seen_roots = set()
@@ -387,6 +500,17 @@ def find_user_volumes() -> Iterator[list[UserVolume]]:
 
         if not any(volume.is_windows_installation for volume in user_volumes):
             details = f" Mount errors: {'; '.join(mount_errors)}" if mount_errors else ""
+            bitlocker_partitions = [
+                partition
+                for partition in partitions
+                if str(partition.get("fstype") or "").casefold() in BITLOCKER_FILESYSTEMS
+            ]
+            if bitlocker_partitions:
+                details += (
+                    " BitLocker volumes were detected and cannot be read while locked: "
+                    + ", ".join(partition["name"] for partition in bitlocker_partitions)
+                    + "."
+                )
             raise FileNotFoundError(
                 "Could not find a Windows installation and Users folder on an "
                 f"available disk partition.{details}"
@@ -426,8 +550,12 @@ def iter_real_user_dirs(users_root: Path) -> list[Path]:
     return user_dirs
 
 
-def write_directory_tree(current: Path, handle, prefix: str = "") -> int:
-    file_count = 0
+def write_directory_tree(
+    current: Path,
+    handle,
+    prefix: str = "",
+) -> BackupSummary:
+    summary = BackupSummary()
     entries = [
         entry
         for entry in sorted(current.iterdir(), key=lambda p: p.name.lower())
@@ -438,15 +566,15 @@ def write_directory_tree(current: Path, handle, prefix: str = "") -> int:
         handle.write(f"{prefix}{connector}{entry.name}\n")
         if entry.is_dir():
             next_prefix = prefix + ("    " if index == len(entries) - 1 else "│   ")
-            file_count += write_directory_tree(entry, handle, next_prefix)
+            summary.add(write_directory_tree(entry, handle, next_prefix))
         elif entry.is_file():
-            file_count += 1
-    return file_count
+            summary.add_file(entry.stat().st_size)
+    return summary
 
 
-def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> int:
+def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> BackupSummary:
     out_dir.mkdir(parents=True, exist_ok=True)
-    total_files = 0
+    summary = BackupSummary()
 
     for volume in volumes:
         users_root = volume.root / "Users"
@@ -457,10 +585,10 @@ def save_directory_trees(volumes: list[UserVolume], out_dir: Path) -> int:
 
             with open(tree_path, "w", encoding="utf-8", errors="ignore") as handle:
                 handle.write(f"{user_dir.name}\n")
-                total_files += write_directory_tree(user_dir, handle)
+                summary.add(write_directory_tree(user_dir, handle))
 
             print(f"Saved directory tree: {tree_path}")
-    return total_files
+    return summary
 
 
 def get_backup_path(volume: UserVolume, windows_volume_count: int, dst: Path) -> Path:
@@ -635,7 +763,8 @@ def copy_file_atomically(source: Path, destination: Path) -> None:
 
 
 def remove_abandoned_temporary_files(out_dir: Path) -> None:
-    for root, _dirs, files in os.walk(out_dir):
+    for root, dirs, files in os.walk(out_dir):
+        dirs.sort()
         for file_name in files:
             if file_name.startswith(".windsmin-copy-") and file_name.endswith(".partial"):
                 (Path(root) / file_name).unlink(missing_ok=True)
@@ -646,15 +775,15 @@ def copy_users_to_usb(
     dst: Path,
     progress_file: Path,
     completed_files: dict[str, dict],
-    total_files: int,
+    total_bytes: int,
 ) -> None:
     windows_volume_count = sum(volume.is_windows_installation for volume in volumes)
-    print(f"Copying {total_files:,} files. Progress updates about every 3 seconds.")
+    print("Copying files. Progress is shown as a percentage and refreshes every 3 seconds.")
 
     with tqdm(
-        total=total_files,
-        unit="file",
+        total=total_bytes,
         desc="Copying Users",
+        bar_format="{desc}: {percentage:3.0f}%",
         mininterval=3,
         dynamic_ncols=True,
     ) as pbar, open(progress_file, "a", encoding="utf-8") as progress_handle:
@@ -684,13 +813,13 @@ def copy_users_to_usb(
                             and destination.is_file()
                             and destination.stat().st_size == signature["size"]
                         ):
-                            pbar.update(1)
+                            pbar.update(signature["size"])
                             continue
 
                         copy_file_atomically(source_file, destination)
                         journal.record(progress_key, signature, destination.parent)
                         completed_files[progress_key] = signature
-                        pbar.update(1)
+                        pbar.update(signature["size"])
         finally:
             journal.sync()
 
@@ -699,7 +828,10 @@ def main():
     global USB
 
     try:
-        USB = resolve_backup_root()
+        partitions = list_partitions()
+        bitlocker_partitions = detect_bitlocker_partitions(partitions)
+        print_hardware_security_status(bitlocker_partitions)
+        USB = resolve_backup_root(partitions)
     except (FileNotFoundError, RuntimeError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)
@@ -707,7 +839,7 @@ def main():
     print(f"Using backup target: {USB}")
 
     try:
-        with find_user_volumes() as volumes:
+        with find_user_volumes(partitions) as volumes:
             print(f"Found {len(volumes)} volume(s) with a Users folder.")
             out_dir = get_source_backup_dir(volumes, USB / "windows_backup")
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -728,7 +860,12 @@ def main():
                 completed_files = {}
 
             remove_abandoned_temporary_files(out_dir)
-            total_files = save_directory_trees(volumes, out_dir)
+            summary = save_directory_trees(volumes, out_dir)
+            required_gib = summary.total_bytes / (1024**3)
+            print(
+                f"Backup size: {required_gib:.2f} GiB "
+                f"({summary.file_count:,} files)."
+            )
 
             print("\nCopying user folders to USB...")
             copy_users_to_usb(
@@ -736,7 +873,7 @@ def main():
                 out_dir,
                 progress_file,
                 completed_files,
-                total_files,
+                summary.total_bytes,
             )
 
             progress_file.unlink(missing_ok=True)
