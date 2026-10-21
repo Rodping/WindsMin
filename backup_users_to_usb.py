@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import termios
-import time
+import threading
 import tty
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -64,7 +64,12 @@ class CtrlSpaceSkipListener:
         self.file_descriptor: int | None = None
         self.original_terminal_settings = None
         self.available = False
-        self.last_poll = 0.0
+        self._stop_event = threading.Event()
+        self._skip_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._active_user: tuple[str, str] | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._reader_error: OSError | ValueError | None = None
 
     def start(self) -> None:
         if not sys.stdin.isatty():
@@ -74,8 +79,18 @@ class CtrlSpaceSkipListener:
         self.original_terminal_settings = termios.tcgetattr(self.file_descriptor)
         tty.setcbreak(self.file_descriptor)
         self.available = True
+        self._reader_thread = threading.Thread(
+            target=self._read_keys,
+            name="ctrl-space-listener",
+            daemon=True,
+        )
+        self._reader_thread.start()
 
     def stop(self) -> None:
+        self._stop_event.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join()
+            self._reader_thread = None
         if self.original_terminal_settings is not None:
             termios.tcsetattr(
                 self.file_descriptor,
@@ -84,19 +99,56 @@ class CtrlSpaceSkipListener:
             )
             self.original_terminal_settings = None
 
+    def begin_user(self, identity: str, user_name: str) -> None:
+        with self._state_lock:
+            self._skip_event.clear()
+            self._active_user = (identity, user_name)
+
+    def end_user(self) -> None:
+        with self._state_lock:
+            self._active_user = None
+
     def skip_requested(self) -> bool:
-        if not self.available or self.file_descriptor is None:
-            return False
+        with self._state_lock:
+            if self._reader_error is not None:
+                raise RuntimeError(
+                    "Could not monitor keyboard input for Ctrl+Space."
+                ) from self._reader_error
+        return self._skip_event.is_set()
 
-        now = time.monotonic()
-        if now - self.last_poll < 0.1:
-            return False
-        self.last_poll = now
-
-        readable, _, _ = select.select([self.file_descriptor], [], [], 0)
-        if not readable:
-            return False
-        return os.read(self.file_descriptor, 1) == b"\x00"
+    def _read_keys(self) -> None:
+        if self.file_descriptor is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                readable, _, _ = select.select(
+                    [self.file_descriptor],
+                    [],
+                    [],
+                    0.1,
+                )
+            except InterruptedError:
+                continue
+            except (OSError, ValueError) as error:
+                with self._state_lock:
+                    self._reader_error = error
+                return
+            if not readable:
+                continue
+            try:
+                key = os.read(self.file_descriptor, 1)
+            except InterruptedError:
+                continue
+            except OSError as error:
+                with self._state_lock:
+                    self._reader_error = error
+                return
+            if not key:
+                return
+            if key == b"\x00":
+                with self._state_lock:
+                    if self._active_user is not None:
+                        self._skip_event.set()
 
 
 @contextmanager
@@ -674,6 +726,7 @@ def save_directory_trees(
             )
             temp_path = Path(temp_name)
 
+            skip_listener.begin_user(volume.identity, user_dir.name)
             print(
                 f"Now scanning user '{user_dir.name}'. "
                 "Ctrl+Space skips this user's tree and file copy.",
@@ -702,6 +755,7 @@ def save_directory_trees(
                 )
                 continue
             finally:
+                skip_listener.end_user()
                 temp_path.unlink(missing_ok=True)
 
             summary.file_count += user_summary.file_count
@@ -937,6 +991,8 @@ def copy_users_to_usb(
                     target_dir = users_dst / current_root.relative_to(users_src)
                     target_dir.mkdir(parents=True, exist_ok=True)
                     for directory in dirs:
+                        if current_root == users_src:
+                            print(f"Copying files for user '{directory.name}'...")
                         (target_dir / directory.name).mkdir(exist_ok=True)
 
                     for file_entry in files:
@@ -965,6 +1021,7 @@ def copy_users_to_usb(
                         pbar.update(signature["size"])
         finally:
             journal.sync()
+        pbar.refresh()
 
 
 def main():

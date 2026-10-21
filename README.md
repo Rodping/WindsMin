@@ -142,8 +142,15 @@ as needed; unrelated files are not deleted.
 
 While a user's directory tree is being scanned, the screen shows which user
 can be skipped. Press `Ctrl+Space` to omit that user's tree and files from this
-run. This requires an interactive terminal. If a previous run already copied
-that user's files, skipping does not delete those older files from the backup.
+run. The key is listened for continuously during that user's scan, so a fast
+scan will not carry the skip over to the next profile. This requires an
+interactive terminal. If a previous run already copied that user's files,
+skipping does not delete the older files or tree report from the backup; it
+only skips this run.
+
+During the copy, the console names each profile being processed, while the
+progress indicator reports the overall percentage rather than printing every
+file name. It refreshes to the final percentage when copying finishes.
 
 ## Requirements
 
