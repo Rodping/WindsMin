@@ -20,7 +20,7 @@ try:
     from tqdm import tqdm
 except ImportError:
     print("Missing dependency: tqdm")
-    print("Install with: apk add python3 py3-tqdm")
+    print("Install with: apt-get install python3-tqdm")
     sys.exit(1)
 
 
@@ -223,7 +223,7 @@ def detect_bitlocker_partitions(partitions: list[dict]) -> list[dict]:
         except FileNotFoundError as error:
             raise RuntimeError(
                 "The blkid utility is required for BitLocker detection. "
-                "Install Alpine's blkid package and try again."
+                "Install Debian's util-linux package and try again."
             ) from error
 
         if (
@@ -262,11 +262,11 @@ def detect_tpm_devices(
 def print_hardware_security_status(bitlocker_partitions: list[dict]) -> None:
     tpm_devices = detect_tpm_devices()
     if tpm_devices:
-        print("TPM: Alpine detected " + ", ".join(tpm_devices) + ".")
+        print("TPM: Debian detected " + ", ".join(tpm_devices) + ".")
         print("     This does not confirm that BitLocker is using this TPM.")
     else:
         print(
-            "TPM: No TPM interface detected by Alpine. It may be absent, disabled "
+            "TPM: No TPM interface detected by Debian. It may be absent, disabled "
             "in firmware, or unsupported by the running kernel."
         )
 
@@ -348,8 +348,8 @@ def get_backup_partition(partitions: list[dict]) -> dict:
         if siblings:
             return max(siblings, key=lambda partition: int(partition.get("size") or 0))
 
-    # If the script is running from RAM, use the unique removable disk with
-    # a small Alpine-sized FAT boot partition and one larger data partition.
+    # Otherwise, identify a unique removable disk with a small FAT boot
+    # partition and a larger writable partition.
     disks: dict[str, list[dict]] = {}
     for partition in partitions:
         parent = partition.get("_parent_name")
@@ -380,8 +380,8 @@ def get_backup_partition(partitions: list[dict]) -> dict:
     if not candidates:
         raise RuntimeError(
             "Could not identify the backup partition. Expected a larger writable "
-            "partition on the removable USB drive that contains the small Alpine "
-            "boot partition. No disk was changed."
+            "partition on a removable USB drive with a small FAT boot partition. "
+            "No disk was changed."
         )
     raise RuntimeError(
         "More than one removable USB drive could be the backup target. "
@@ -544,6 +544,9 @@ def unmount(mountpoint: str) -> None:
 def is_backup_volume(mountpoint: Path) -> bool:
     backup_path = USB.resolve()
     source_path = mountpoint.resolve()
+    if backup_path == Path("/"):
+        # Every mounted source path is below /, but it may be another device.
+        return source_path == backup_path
     try:
         backup_path.relative_to(source_path)
         return True
@@ -1037,6 +1040,7 @@ def main():
         sys.exit(1)
 
     print(f"Using backup target: {USB}")
+    print(f"Backup files will be written to: {USB / 'windows_backup'}")
 
     try:
         with find_user_volumes(partitions) as volumes:
@@ -1079,7 +1083,7 @@ def main():
                 )
                 print(f"Skipped users for this run: {skipped_names}")
 
-            print("\nCopying user folders to USB...")
+            print("\nCopying user folders to the backup destination...")
             copy_users_to_usb(
                 volumes,
                 out_dir,

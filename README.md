@@ -3,8 +3,9 @@
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
 This project contains a script for copying user-profile files from Windows
-disks while running Alpine Linux from a bootable USB drive. It is intended for
-authorized backups and recovery.
+disks while running Debian GNU/Linux 13.7 (Trixie) from a USB drive installed
+from the `debian-13.7.0-amd64-netinst` installer with the command-line system.
+It is intended for authorized backups and recovery.
 
 ## What the backup script does
 
@@ -25,19 +26,19 @@ prints a highly visible warning if it finds any. It continues with other
 readable volumes, but cannot copy data from a BitLocker volume while it is
 locked. Unlock it in Windows or with an authorized recovery method first; do
 not format it. The detection uses the filesystem type reported by `lsblk` and
-the `blkid` probe from Alpine's `blkid` package. See the
+the `blkid` probe provided by Debian's `util-linux` package. See the
 [util-linux BitLocker probe](https://github.com/util-linux/util-linux/blob/master/libblkid/src/superblocks/bitlocker.c).
 
-The script checks whether Alpine exposes a TPM device through
+The script checks whether Debian exposes a TPM device through
 `/sys/class/tpm` or `/dev/tpm*`. It reports a TPM interface as detected or
 not detected. A missing interface does not prove that the computer has no TPM:
-the firmware may disable it or the running Alpine kernel may lack its driver.
+the firmware may disable it or the running Debian kernel may lack its driver.
 Detecting a TPM also does not prove BitLocker is configured to use it.
 The kernel documents the
 [TPM sysfs interface](https://github.com/torvalds/linux/blob/master/Documentation/ABI/stable/sysfs-class-tpm).
 
 It searches supported local disk partitions, not just Windows drive letters.
-Windows letters such as `C:`, `D:`, and `H:` are not used by Alpine; Linux
+Windows letters such as `C:`, `D:`, and `H:` are not used by Debian; Linux
 identifies partitions by device names such as `/dev/sda2` or `/dev/nvme0n1p3`.
 The script can find a `Users` folder at the root of another attached volume,
 but it does not search arbitrary paths such as `D:\Profiles`.
@@ -70,20 +71,30 @@ contents. The script also skips symbolic links and junctions.
 
 ## Backup destination
 
-The script automatically selects the larger writable partition on the
-removable USB drive that also contains the small Alpine boot partition. It
-does not need a volume label. It prefers a suitable sibling partition on the
-same USB drive as the script; when Alpine is running from RAM, it looks for a
+The script automatically selects a writable partition on a removable USB
+drive. It does not need a volume label. It prefers a suitable sibling
+partition on the same USB drive as the script; otherwise, it looks for a
 unique removable drive with a small FAT boot partition (up to 3 GB) and a
-larger data partition (at least 10 GiB). The 13.5 GiB data partition on a
-nominal 16 GB flash drive is large enough to meet this detection threshold.
+larger writable partition (at least 10 GiB).
+
+On the Debian 13.7 USB installation described here, `/dev/sda1` is the small
+FAT EFI boot partition and `/dev/sda2` is the larger ext4 Debian system
+partition. The script therefore selects `/dev/sda2` for backups when this
+partition layout is present. Backup files are stored in
+`/windows_backup` on that partition, alongside the Debian system. Linux device
+names can change between boots (the installer recorded this partition as
+`/dev/sdb2`), so the script detects the target from the live partition layout
+rather than relying on a fixed `/dev/sda2` name. Keeping the backup on the
+system USB means a failure or loss of that flash drive can destroy both the
+system and its backups; use a separate backup drive if that risk is not
+acceptable.
 
 The selected partition must already have a supported filesystem. The script
 does not format, rename, or erase it. If it is not mounted, the script mounts
 it read-write at a path such as `/mnt/windsmin-backup-sdb2`. If there is more
 than one possible USB drive, or the intended partition cannot be identified
 safely, the script stops and reports the problem instead of writing to the
-Alpine system disk.
+Debian system disk.
 
 Backups are stored in a `windows_backup` directory on the selected partition:
 
@@ -99,7 +110,9 @@ When multiple Windows installations are found, their profiles are placed under
 `OtherVolumes/<device>/Users/` to avoid mixing them. Make sure the data
 partition has enough free space for the files being copied. A destination
 partition mounted by the script stays mounted at its `/mnt/windsmin-backup-*`
-path until it is unmounted or the computer shuts down.
+path until it is unmounted or the computer shuts down. When the selected
+partition is already mounted as `/`, backups are written under
+`/windows_backup`.
 FAT32 volumes cannot store a single file larger than 4 GB. The script warns
 when the selected partition is reported as `vfat`; use a suitable filesystem
 such as exFAT if your backup includes larger files. Formatting a partition
@@ -154,57 +167,69 @@ file name. It refreshes to the final percentage when copying finishes.
 
 ## Requirements
 
-- Alpine Linux with permission to inspect and mount disks (normally run as
-  `root`).
-- `lsblk`, `findmnt`, `mount`, and `umount` from `util-linux`, plus Alpine's
-  `blkid` package for BitLocker detection.
-- Python 3 and the Python `tqdm` progress-bar package, installed on Alpine as
-  `python3` and `py3-tqdm`.
+- Debian GNU/Linux 13.7 (Trixie) or a newer release that provides Python 3.10
+  or later and the packages listed below. Run the scripts as `root`.
+- `lsblk`, `findmnt`, `mount`, `umount`, and `blkid` from Debian's `util-linux`
+  package.
+- Python 3 and the Python `tqdm` progress-bar package, installed as
+  `python3` and `python3-tqdm`.
 - `git`, used by the launcher to update this repository.
 - Filesystem support for the source partitions. The script considers NTFS,
   exFAT, FAT, ext2/3/4, Btrfs, and XFS partitions. NTFS mounting tries the
   `ntfs3` driver and then `ntfs-3g`.
-- A removable USB drive with a small Alpine boot partition and a larger,
-  writable data partition formatted with a supported filesystem.
+- Python 3.10 is the minimum because the scripts use modern type-annotation
+  syntax. Debian releases with a newer Python 3 are compatible; newer releases
+  have not all been separately tested.
+- A removable USB drive with a small FAT boot partition and a larger,
+  writable partition formatted with a supported filesystem. For the Debian
+  installation described above, the larger partition is also the system
+  partition.
 
-## Running it on Alpine
+## Running it on Debian 13.7 or newer
 
 From the project directory, run:
 
 ```sh
-sh backup.sh
+sudo sh backup.sh
 ```
 
-`backup.sh` installs `python3`, `py3-tqdm`, `util-linux`, `blkid`, `ntfs-3g`,
-and `git` with Alpine's `apk` package manager, pulls the latest project changes
-with `git pull`, then starts the Python script. The script's required Python
-dependency (`tqdm`) is installed as Alpine's `py3-tqdm` package; it does not
-need `pip install`. All other Python imports use the Python standard library,
-so no additional pip packages are needed. Package installation and `git pull`
-require network access.
-You can run `python3 backup_users_to_usb.py` directly if the requirements are
-already installed.
+`backup.sh` updates Debian's package index, installs `python3`,
+`python3-tqdm`, `util-linux`, `ntfs-3g`, and `git` with `apt-get`, pulls the
+latest project changes with `git pull`, then starts the Python script. The
+`blkid` utility is included in Debian's `util-linux` package. The script's
+Python dependency (`tqdm`) is installed as `python3-tqdm`; it does not need
+`pip install`. All other Python imports use the standard library. Package
+installation and `git pull` require network access.
 
-The current script does not require `/mnt/usb`; it selects the data partition
-and mounts it under `/mnt/windsmin-backup-<device>` if needed. If you see the
-message `USB not mounted: /mnt/usb`, the older script is still being run. Check
-that the repository is on the branch containing automatic backup-partition
-detection and that `git pull` actually updated it before running the backup.
+If the requirements are already installed and the project is up to date, run
+the script directly as root:
+
+```sh
+sudo python3 backup_users_to_usb.py
+```
+
+The script does not require `/mnt/usb`; it selects the backup partition and
+mounts it under `/mnt/windsmin-backup-<device>` if needed. In the described
+Debian layout, `/dev/sda2` is already mounted as `/`, so the backup directory
+is `/windows_backup`. Check the startup message `Using backup target:` before
+proceeding.
 
 The source partitions that the script mounts itself are mounted read-only.
 Already-mounted source partitions keep their existing mount mode.
 
-## Alpine diskless mode and `lbu commit`
+## Deleting backups
 
-The backup files are written to the selected data partition, not to Alpine's
-RAM-based root filesystem; `lbu commit` is not needed to save them. The script
-does not run `lbu commit`.
+To delete stored backup sets, run the separate interactive script as root:
 
-On a diskless Alpine system, packages installed with `apk add` may not remain
-installed after reboot unless the system's local backup configuration saves
-them. If you want the installed tools to persist across reboots, use Alpine's
-normal `lbu` process after installing them. This is separate from the Windows
-backup and does not save the copied profile files.
+```sh
+sudo python3 delete_backup.py
+```
+
+It uses the same removable-drive detection as the backup script and lists the
+found `source_<12-hex-digits>` backup folders. Choose one folder or all listed
+folders, then enter the requested exact confirmation. It does not format the
+USB, delete the `windows_backup` parent folder, or touch unrelated files or
+the Debian system. Deleted backups cannot be recovered from this script.
 
 ## Limitations and safety
 

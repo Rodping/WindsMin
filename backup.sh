@@ -1,11 +1,16 @@
 #!/bin/sh
 set -eu
 
-apk add --no-cache \
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this launcher as root, for example: sudo sh backup.sh" >&2
+    exit 1
+fi
+
+apt-get update
+apt-get install -y --no-install-recommends \
     python3 \
-    py3-tqdm \
+    python3-tqdm \
     util-linux \
-    blkid \
     ntfs-3g \
     git
 
